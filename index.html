@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Craftfiti Shift Log</title>
+<meta name="theme-color" content="#1F1A14">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Shift Log">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@500;600;700&family=IBM+Plex+Sans+Thai:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="./config.js"></script>
+<script>
+  // If ?mock=1 is present, load the pure logic module + mock seed/api before starting the app.
+  // These paths only exist in the dev repo layout; on GitHub Pages they are never requested
+  // unless someone manually adds ?mock=1 (in which case they 404 harmlessly).
+  (function () {
+    var qs = location.search || '';
+    var useMock = qs.indexOf('mock=1') !== -1;
+    function loadScript(src, cb) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = cb;
+      s.onerror = cb;
+      document.head.appendChild(s);
+    }
+    function startApp() {
+      loadScript('./app.js', function () {});
+    }
+    if (useMock) {
+      loadScript('../gas/Logic.js', function () {
+        loadScript('../dev/mock-seed.js', function () {
+          loadScript('../dev/mock-api.js', function () {
+            startApp();
+          });
+        });
+      });
+    } else {
+      startApp();
+    }
+  })();
+</script>
+</body>
+</html>
