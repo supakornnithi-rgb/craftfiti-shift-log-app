@@ -45,6 +45,9 @@
     return out;
   }
   function ymLabel(ym) { var p = ym.split('-'); return THAI_MONTH_FULL[Number(p[1]) - 1] + ' ' + p[0]; }
+  // P6: pay-period helpers (event month vs. next month, short Thai label).
+  function nextYm(ym) { var p = ym.split('-'); var y = Number(p[0]), m = Number(p[1]) + 1; if (m > 12) { m = 1; y++; } return y + '-' + pad2(m); }
+  function monthYearShort(ym) { var p = ym.split('-'); return THAI_MONTH_SHORT[Number(p[1]) - 1] + ' ' + p[0]; }
   function fmtDT(iso) {
     if (!iso) return '';
     var datePart = iso.slice(0, 10), timePart = iso.slice(11, 16);
@@ -567,6 +570,8 @@
     if (day.events.length) {
       eventsHtml = day.events.map(function (e) {
         var tag = (e.type === 'absent' && e.portion === 0.5) ? 'ขาดครึ่งวัน' : TYPE_TAG[e.type];
+        // P6 §4.4.3: small pill when this event's money was carried to a different pay period.
+        var carriedPill = e.pay_carried ? '<span class="pill" style="background:#EDE3D0;color:#6B4A17">คิดเงิน ' + esc(THAI_MONTH_SHORT[Number(e.pay_period.slice(5, 7)) - 1]) + '</span>' : '';
         var moneyHtml = (e.money || []).map(function (line) {
           var cls = line.amount > 0 ? 'amt-pos' : (line.amount < 0 ? 'amt-neg' : 'amt-zero');
           var text = line.label + (line.bucket === 'temp' ? ' · จ่ายนอกสลิป' : '');
@@ -576,13 +581,14 @@
         if (e.updated_by) meta += ' · แก้โดย ' + esc(e.updated_by);
         if (e.note) meta += ' · ' + esc(e.note);
         meta += ' · ' + (e.cal_status === 'ok' ? 'ส่งเข้า Calendar แล้ว' : '⚠️ ยังไม่เข้า Calendar');
-        var editDelete = month.closed ? '' :
+        // P6 §4.4.3: hide edit/delete based on the EVENT's own pay period being closed, not the day's month.
+        var editDelete = e.pay_closed ? '' :
           '<div style="display:flex;gap:14px;margin-top:8px">' +
           '<button type="button" data-act="editEvent" data-id="' + esc(e.event_id) + '" style="font-size:12px;font-weight:600;color:#9A4F0E">แก้ไข</button>' +
           '<button type="button" data-act="deleteEvent" data-id="' + esc(e.event_id) + '" class="btn-danger" style="font-size:12px;font-weight:600">ลบ</button>' +
           '</div>';
         return '<div class="event-card">' +
-          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="' + TYPE_PILLCLS[e.type] + '">' + esc(tag) + '</span><span style="font-size:14px;font-weight:500">' + esc(e.title) + '</span></div>' +
+          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="' + TYPE_PILLCLS[e.type] + '">' + esc(tag) + '</span><span style="font-size:14px;font-weight:500">' + esc(e.title) + '</span>' + carriedPill + '</div>' +
           moneyHtml +
           '<div class="event-meta">' + meta + '</div>' +
           editDelete +
@@ -592,9 +598,9 @@
       eventsHtml = '<div style="font-size:13px;color:#7A7064;margin-top:6px">ไม่มีการเปลี่ยนแปลง เป็นไปตามตาราง</div>';
     }
 
-    var addBtn = month.closed
-      ? '<span class="pill" style="margin-top:12px;display:inline-flex;background:#FBE8C4;color:#744400">งวดปิดแล้ว</span>'
-      : '<button type="button" class="btn-secondary" style="margin-top:12px" data-act="addEvent">+ เพิ่มเหตุการณ์วันนี้</button>';
+    // P6 §4.4.3: the "add event" button stays visible even when the day's own month is closed
+    // (a late event dated in a closed month is now allowed — its money carries to the next open period).
+    var addBtn = '<button type="button" class="btn-secondary" style="margin-top:12px" data-act="addEvent">+ เพิ่มเหตุการณ์วันนี้</button>';
 
     // P5 §4.5: on Tuesdays the popup also shows the Tuesday-slot selector inline (staff and owner alike).
     var tueHtml = '';
@@ -638,6 +644,7 @@
       tempSub: '', newTempNick: '', newTempRate: 625, newTempRegular: true,
       adhocPerson: '', swapA: '', swapB: '', note: '', eventId: '', saved: false, savedCalNote: '',
       dayRoster: [], dayRoster2: [], tueChoice: '', tueCurrent: '',
+      payPeriodChoice: 'event', dateMonthClosed: false,
       preview: { title: '', money: [], errors: [], warnings: [] }, previewTimer: null
     };
     if (editingEvent) {
@@ -648,6 +655,8 @@
       recState.date2 = e.date2 || '';
       recState.note = e.note || '';
       recState.portion = e.portion || 1;
+      // P6: prefill the pay-period choice from the saved event (falls back to the event month for legacy rows).
+      recState.payPeriodChoice = (e.pay_period && e.pay_period !== e.date.slice(0, 7)) ? 'next' : 'event';
       if (e.type === 'absent' || e.type === 'emergency') {
         recState.absentee = e.person_id;
         if (e.person2_id) {
@@ -705,6 +714,7 @@
     getMonth(ym).then(function (month) {
       var day = month.days[Number(recState.date.slice(8, 10)) - 1];
       recState.dayRoster = day ? day.roster : [];
+      recState.dateMonthClosed = !!month.closed; // P6: drives the "คิดเงินงวด" field
       if (recState.type === 'swap' && recState.date2) {
         getMonth(recState.date2.slice(0, 7)).then(function (month2) {
           var day2 = month2.days[Number(recState.date2.slice(8, 10)) - 1];
@@ -743,12 +753,23 @@
     return false;
   }
 
+  // P6: pay_period payload for absent/emergency/adhoc — omitted (server defaults to the event
+  // month) when the event month is not closed and the recorder kept the default choice; when the
+  // event month IS closed the server forces the pay period regardless, so nothing is sent.
+  function payPeriodPayloadFor(type) {
+    if (type !== 'absent' && type !== 'emergency' && type !== 'adhoc') return undefined;
+    if (recState.dateMonthClosed) return undefined;
+    return recState.payPeriodChoice === 'next' ? nextYm(recState.date.slice(0, 7)) : '';
+  }
+
   function buildEventPayload() {
     var ev = {};
     if (recState.eventId) ev.event_id = recState.eventId;
     ev.type = recState.type;
     ev.date = recState.date;
     ev.note = recState.note || '';
+    var payPeriod = payPeriodPayloadFor(recState.type);
+    if (payPeriod !== undefined) ev.pay_period = payPeriod;
     if (recState.type === 'absent' || recState.type === 'emergency') {
       ev.person_id = recState.absentee;
       ev.portion = recState.portion;
@@ -806,8 +827,16 @@
     }).join('');
     var warnHtml = (pv.warnings || []).map(function (w) { return '<div class="warn-box">' + esc(w) + '</div>'; }).join('');
     var errHtml = (pv.errors || []).map(function (w) { return '<div class="error-box">' + esc(w) + '</div>'; }).join('');
+    // P6 §4.4.2: pay period line, with "(ยกไปเดือนถัดไป)" when it differs from the event's own month.
+    var payPeriodLine = '';
+    if (pv.pay_period) {
+      var evMonth = recState.date ? recState.date.slice(0, 7) : '';
+      var carried = pv.pay_period !== evMonth;
+      payPeriodLine = '<div style="font-size:13px;font-weight:500;margin-top:4px">คิดเงินงวด: ' + esc(monthYearShort(pv.pay_period)) + (carried ? ' (ยกไปเดือนถัดไป)' : '') + '</div>';
+    }
     var previewHtml = '<div class="card" style="margin-top:18px">' +
       '<div style="font-size:13px;font-weight:500">ชื่อใน Calendar: ' + esc(pv.title || '—') + '</div>' +
+      payPeriodLine +
       linesHtml + warnHtml + errHtml +
       '</div>';
     var disableSave = !recRequiredOk() || (pv.errors && pv.errors.length > 0);
@@ -913,6 +942,23 @@
         '</div>';
     }
 
+    // P6 §4.4.1: pay-period ("คิดเงินงวด") field for absent/emergency/adhoc — hidden for swap/tue.
+    var payPeriodHtml = '';
+    if (recState.type === 'absent' || recState.type === 'emergency' || recState.type === 'adhoc') {
+      var evMonth = recState.date.slice(0, 7);
+      var nextM = nextYm(evMonth);
+      if (recState.dateMonthClosed) {
+        var forcedYm = (recState.preview && recState.preview.pay_period) || nextM;
+        payPeriodHtml = '<div class="lbl">คิดเงินงวด</div>' +
+          '<div class="warn-box">เดือน ' + esc(monthYearShort(evMonth)) + ' ปิดงวดแล้ว — เงินจะไปคิดในงวด ' + esc(monthYearShort(forcedYm)) + '</div>';
+      } else {
+        payPeriodHtml = '<div class="lbl">คิดเงินงวด</div><div class="seg seg-2">' +
+          '<button type="button" class="sg' + (recState.payPeriodChoice === 'event' ? ' sg-on' : '') + '" data-act="setPayPeriodChoice" data-c="event">' + esc(monthYearShort(evMonth)) + '</button>' +
+          '<button type="button" class="sg' + (recState.payPeriodChoice === 'next' ? ' sg-on' : '') + '" data-act="setPayPeriodChoice" data-c="next">' + esc(monthYearShort(nextM)) + '</button>' +
+          '</div>';
+      }
+    }
+
     // P5 §4.5: Tuesday-slot tab (moved from Settings). Editable by staff and owner alike (owner decision override).
     var tueHtml = '';
     if (recState.type === 'tue') {
@@ -942,7 +988,7 @@
       '<label class="lbl" for="recDate" style="margin-top:0">วันที่</label>' +
       '<input type="date" id="recDate" data-oninput="setDate" value="' + esc(recState.date) + '" style="width:100%;height:48px">' +
       '<div style="font-size:12px;color:#6B6257;margin-top:6px">เวรวันนี้: ' + esc(rosterNames.join(' · ') || '—') + '</div>' +
-      typeHtml + absentHtml + swapHtml + adhocHtml + tueHtml +
+      typeHtml + absentHtml + swapHtml + adhocHtml + payPeriodHtml + tueHtml +
       (recState.type === 'tue' ? '' : noteHtml + previewSaveHtml()) +
       '</main>' +
       navHtml('record') +
@@ -954,6 +1000,7 @@
       recState.type = t;
       loadRosterAndDraw();
     };
+    actions.setPayPeriodChoice = function (el) { recState.payPeriodChoice = el.getAttribute('data-c'); drawRecord(); schedulePreview(); };
     actions.setTueChoice = function (el) { recState.tueChoice = el.value; };
     actions.saveTueSlot = function (el) {
       withSavingButton(el, function () { return api('setTueSlot', { date: recState.date, person_id: recState.tueChoice || '' }).then(function () {
@@ -1145,6 +1192,7 @@
       '<span style="font-size:12px;font-weight:600;color:#6B6257">กรรมการ + พนักงาน (เข้าสลิป)</span>' +
       '<span style="font-size:11px;color:#7A7064">' + payout.people.length + ' คนมีรายการ</span>' +
       '</div>' +
+      (payout.carried > 0 ? '<div style="font-size:12px;color:#6B6257;margin:0 2px 8px">รวมรายการยกมาจากเดือนก่อน ' + payout.carried + ' รายการ</div>' : '') +
       '<div class="card-plain" style="overflow:hidden">' +
       '<div style="display:grid;grid-template-columns:minmax(0,1fr) 84px 84px;padding:8px 14px;font-size:11px;font-weight:600;color:#6B6257;background:#F8F4EC"><span>ชื่อ · รหัส</span><span style="text-align:right">รายได้อื่นๆ</span><span style="text-align:right">ขาดงาน</span></div>' +
       peopleHtml +
