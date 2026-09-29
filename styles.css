@@ -270,3 +270,11 @@ button, .tap-target { min-height: 44px; }
 @media (max-width: 480px) {
   .shell { border-radius: 0; }
 }
+
+/* P8: small corner spinner shown during the background bundle refresh (no tap lock). */
+.bg-spin {
+  position: fixed; top: 10px; right: 10px; width: 16px; height: 16px; z-index: 40;
+  border: 2px solid rgba(154, 79, 14, 0.25); border-top-color: #9A4F0E; border-radius: 50%;
+  animation: bg-spin-rot 0.8s linear infinite; pointer-events: none;
+}
+@keyframes bg-spin-rot { to { transform: rotate(360deg); } }

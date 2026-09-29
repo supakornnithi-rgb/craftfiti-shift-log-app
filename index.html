@@ -16,8 +16,11 @@
 <body>
 <div id="app"></div>
 <script src="./config.js"></script>
+<!-- P8: the app computes month/stats/payout/preview itself with the same pure logic as the server.
+     logic.js is an exact copy of gas/Logic.js (npm run sync-logic); it is the ONLY copy loaded, in mock mode too. -->
+<script src="./logic.js"></script>
 <script>
-  // If ?mock=1 is present, load the pure logic module + mock seed/api before starting the app.
+  // If ?mock=1 is present, load the mock seed/api before starting the app.
   // These paths only exist in the dev repo layout; on GitHub Pages they are never requested
   // unless someone manually adds ?mock=1 (in which case they 404 harmlessly).
   (function () {
@@ -34,11 +37,9 @@
       loadScript('./app.js', function () {});
     }
     if (useMock) {
-      loadScript('../gas/Logic.js', function () {
-        loadScript('../dev/mock-seed.js', function () {
-          loadScript('../dev/mock-api.js', function () {
-            startApp();
-          });
+      loadScript('../dev/mock-seed.js', function () {
+        loadScript('../dev/mock-api.js', function () {
+          startApp();
         });
       });
     } else {

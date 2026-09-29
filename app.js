@@ -11,18 +11,28 @@
   function lsGetJSON(k) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
   function lsSetJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* ignore */ } }
 
+  // P8: today's date in Bangkok, computed locally (device timezone independent) so the app can
+  // paint instantly from the persisted bundle; the server's `today` replaces it after bootstrap.
+  function bkkToday() { return new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10); }
+
   var state = {
     token: lsGet('sl_token') || '',
     role: lsGet('sl_role') || '',
     who: lsGet('sl_who') || '',
     users: lsGetJSON('sl_users') || cfg.APP_USERS,
+    // P8 local-first: `bundle` is the whole data set (people, rates, templates, tueSlots, events,
+    // periods, tempPayments, config). Every view is computed from it with Logic.js; only writes and
+    // login talk to the server, and every write returns a fresh bundle.
+    bundle: null,
+    bundleVer: 0,       // bumped whenever a write installs a new bundle (drops stale background refreshes)
+    refreshedAt: 0,
     people: [],
     appUsers: cfg.APP_USERS,
     tueAllowed: [],
-    today: '',
-    ym: '',
-    monthCache: {}
+    today: bkkToday(),
+    ym: ''
   };
+  state.ym = state.today.slice(0, 7);
 
   function esc(s) {
     var d = document.createElement('div');
@@ -30,7 +40,7 @@
     return d.innerHTML;
   }
 
-  // ---------- date / thai helpers (self-contained; Logic.js is NOT loaded in production) ----------
+  // ---------- date / thai helpers ----------
   var THAI_MONTH_SHORT = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
   var THAI_MONTH_FULL = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
   var THAI_WEEKDAY_FULL = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
@@ -85,8 +95,8 @@
     setTimeout(function () { if (toastEl) { toastEl.remove(); toastEl = null; } }, 3200);
   }
   // ---------- P5 §4.3: loading bar with % label + tap-lock overlay ----------
-  // Several concurrent requests share one bar/overlay via a counter. Background prefetch (api(action, payload, {silent:true}))
-  // never shows the bar or the overlay.
+  // Several concurrent requests share one bar/overlay via a counter. P8: the bar + tap lock now appear only for writes and login;
+  // background calls (api(action, payload, {silent:true}), e.g. bootstrap refresh, syncCalendar) never show them.
   var loadingCount = 0; // visible (non-silent) requests in flight
   var loadingPct = 0;
   var loadingTimer = null;
@@ -170,14 +180,38 @@
 
   function clearSession() {
     state.token = ''; state.role = ''; state.who = '';
-    lsDel('sl_token'); lsDel('sl_role'); lsDel('sl_who');
+    state.bundle = null; state.people = []; state.tueAllowed = [];
+    lsDel('sl_token'); lsDel('sl_role'); lsDel('sl_who'); lsDel('sl_bundle');
   }
 
   // ---------- API helper ----------
-  // opts.silent = true -> background prefetch: no loading bar, no tap-lock overlay (P5 §4.2/§4.3).
+  // opts.silent = true -> background call: no loading bar, no tap-lock overlay, no error toast.
+  // opts.spin   = true -> (with silent) show only the small corner spinner (background bootstrap).
+  var spinCount = 0;
+  function setSpin(on) {
+    spinCount += on ? 1 : -1;
+    if (spinCount < 0) spinCount = 0;
+    var el = document.getElementById('bgSpin');
+    if (spinCount > 0 && !el) {
+      el = document.createElement('div');
+      el.id = 'bgSpin';
+      el.className = 'bg-spin';
+      el.setAttribute('aria-label', 'กำลังอัปเดตข้อมูล');
+      document.body.appendChild(el);
+    } else if (spinCount === 0 && el) {
+      el.remove();
+    }
+  }
+
   function api(action, payload, opts) {
     var silent = !!(opts && opts.silent);
+    var spin = !!(opts && opts.spin);
     if (!silent) setLoading(true);
+    if (spin) setSpin(true);
+    function done() {
+      if (!silent) setLoading(false);
+      if (spin) setSpin(false);
+    }
     var p;
     if (window.SHIFTLOG_MOCK) {
       p = window.SHIFTLOG_MOCK(action, state.token, payload || {});
@@ -189,7 +223,7 @@
       }).then(function (r) { return r.json(); });
     }
     return p.then(function (res) {
-      if (!silent) setLoading(false);
+      done();
       if (!res || !res.ok) {
         var msg = (res && res.error) || 'เกิดข้อผิดพลาด';
         var code = res && res.code;
@@ -206,32 +240,78 @@
       }
       return res.data;
     }, function (networkErr) {
-      if (!silent) { setLoading(false); toast('เชื่อมต่อไม่ได้'); }
+      done();
+      if (!silent) toast('เชื่อมต่อไม่ได้');
       throw networkErr;
     });
   }
 
-  function getMonth(ym, opts) {
-    if (state.monthCache[ym]) return Promise.resolve(state.monthCache[ym]);
-    return api('month', { ym: ym }, opts).then(function (data) { state.monthCache[ym] = data; return data; });
+  // ---------- P8 local-first bundle ----------
+  var BUNDLE_MAX_CHARS = 2 * 1024 * 1024; // do not persist anything bigger than ~2 MB
+  function persistBundle() {
+    try {
+      var json = JSON.stringify(state.bundle);
+      if (json.length > BUNDLE_MAX_CHARS) { lsDel('sl_bundle'); return; }
+      localStorage.setItem('sl_bundle', json);
+    } catch (e) { /* storage full / unavailable: keep running from memory */ }
   }
-  function invalidateMonth(ym) { delete state.monthCache[ym]; }
-  function invalidateAllMonths() { state.monthCache = {}; }
 
-  // P5 §4.2: after rendering a month, silently prefetch the adjacent months in the background.
-  function prefetchAdjacentMonths(ym) {
-    function shiftYm(base, delta) {
-      var y = Number(base.slice(0, 4)), m = Number(base.slice(5, 7)) + delta;
-      if (m < 1) { m = 12; y--; }
-      if (m > 12) { m = 1; y++; }
-      return y + '-' + pad2(m);
+  function installBundle(b) {
+    state.bundle = b;
+    state.people = b.people || [];
+    var cf = b.config || {};
+    state.tueAllowed = cf.tue_allowed || [];
+    if (cf.app_users && cf.app_users.length) {
+      state.appUsers = cf.app_users;
+      state.users = cf.app_users;
+      lsSetJSON('sl_users', cf.app_users);
     }
-    [shiftYm(ym, -1), shiftYm(ym, 1)].forEach(function (adjYm) {
-      if (!state.monthCache[adjYm]) {
-        getMonth(adjYm, { silent: true }).catch(function () { /* ignore prefetch failure */ });
-      }
-    });
   }
+
+  // After every write the server returns a fresh bundle: replace ours and persist it.
+  function applyWriteBundle(res) {
+    if (res && res.bundle) {
+      state.bundleVer++;
+      installBundle(res.bundle);
+      persistBundle();
+    }
+    return res;
+  }
+
+  // A write call: shows the loading bar + tap lock (non-silent) and installs the returned bundle.
+  function write(action, payload) {
+    return api(action, payload).then(applyWriteBundle);
+  }
+
+  // Background: fire-and-forget Calendar sync for a saved/deleted event (no bar, no lock, silent errors).
+  // The result only patches cal_status in the local bundle; nothing is re-fetched.
+  function syncCalendarBg(eventId) {
+    api('syncCalendar', { event_id: eventId }, { silent: true }).then(function (r) {
+      if (!state.bundle || !r) return;
+      var ev = state.bundle.events.find(function (e) { return e.event_id === r.event_id; });
+      if (ev && ev.cal_status !== r.cal_status) {
+        ev.cal_status = r.cal_status;
+        persistBundle();
+        repaintCurrent();
+      }
+    }).catch(function () { /* silent: the event keeps showing its Calendar warning */ });
+  }
+
+  // ---------- local computations (same Logic.js as the server) ----------
+  function localMonth(ym) { return window.monthView(ym, state.bundle); }
+  function localStats(ym) { return window.monthStats(ym, state.bundle); }
+  function localPayout(ym) {
+    var payout = window.monthPayout(ym, state.bundle);
+    payout.closed = window.isClosedYm(ym, state.bundle.periods);
+    var tp = (state.bundle.tempPayments || []).filter(function (r) { return r.period === ym; })[0];
+    payout.tempPaid = tp ? { paid: tp.paid, marked_by: tp.marked_by, marked_at: tp.marked_at } : null;
+    return payout;
+  }
+  function findEvent(id) {
+    return (state.bundle ? state.bundle.events : []).filter(function (e) { return e.event_id === id; })[0] || null;
+  }
+  // First allowed Tuesday person (planner order) is the default choice for an unassigned Tuesday.
+  function defaultTueId() { return (state.tueAllowed && state.tueAllowed[0]) || ''; }
 
   // ---------- router ----------
   var actions = {};
@@ -287,6 +367,8 @@
     if (!state.token && r.name !== 'login') { navigate('#login'); return; }
     if (state.token && r.name === 'login') { navigate('#calendar'); return; }
     actions = {};
+    // P8: no bundle yet (first login / cold start without a persisted copy) -> skeleton until bootstrap returns.
+    if (r.name !== 'login' && !state.bundle) { app.innerHTML = shellSkeleton('กำลังโหลด…', 'calendar'); return; }
     switch (r.name) {
       case 'login': return renderLogin();
       case 'calendar': return renderCalendar(r.params);
@@ -298,6 +380,21 @@
     }
   }
   window.addEventListener('hashchange', route);
+
+  // P8: redraw the current screen after the bundle changed in the background (bootstrap refresh or a
+  // Calendar-status patch) WITHOUT resetting UI state (open pop-ups, half-filled record form).
+  function repaintCurrent() {
+    if (!state.bundle || !state.token) return;
+    var r = currentRoute();
+    switch (r.name) {
+      case 'calendar': paintCalendar(); break;
+      case 'stats': renderStats(); break;
+      case 'payout': renderPayout(); break;
+      case 'record': refreshRecordFromBundle(); break;
+      case 'settings': if (state.role === 'owner' && !settingsState.modal) renderSettings(); break;
+      default: break;
+    }
+  }
 
   // ---------- shared chrome ----------
   var ICONS = {
@@ -379,6 +476,8 @@
         lsSet('sl_token', state.token); lsSet('sl_role', state.role); lsSet('sl_who', state.who);
         lsSet('sl_last_who', state.who);
         loginState = { who: state.who, password: '', error: '' };
+        state.bundle = null; // a different user may log in on this device: never show the previous copy
+        lsDel('sl_bundle');
         boot();
       }).catch(function (err) {
         loginState.error = err.message || 'เข้าสู่ระบบไม่สำเร็จ';
@@ -391,7 +490,7 @@
   var calState = { selectedByYm: {}, modalOpen: false };
   // P7 §4.3.1: monthly Tuesday planner state — `choices` holds date -> person_id (unsaved until
   // "บันทึกทั้งเดือน"), `originalUnassigned` remembers which rows started blank (for the
-  // "ค่าเริ่มต้น" GINK-default badge).
+  // "ค่าเริ่มต้น" default-person badge).
   var tuePlanState = { open: false, ym: '', plan: null, choices: {}, originalUnassigned: {} };
   var CHANGED_STATUSES = ['abs', 'hab', 'emg', 'sub', 'tmp', 'adh', 'swo', 'swi'];
   var STATUS_LABEL = { base: 'ตามเวร', abs: 'ขาด', hab: 'ขาดครึ่งวัน', sub: 'เข้าแทน', adh: 'AdHoc', swo: 'สลับออก', swi: 'สลับเข้า', emg: 'ลาฉุกเฉิน', tmp: 'คนนอกเข้าแทน' };
@@ -409,31 +508,36 @@
     return p ? p.nick : r.id;
   }
 
+  // Root cause of the P8 "calendar stuck after saving" bug: saveRecord navigated to
+  // '#calendar?date=YYYY-MM-DD' and the old renderCalendar treated that ?date= as the source of truth on
+  // EVERY route() call. shiftMonth() (the month arrows) changes state.ym and calls route(), which re-parsed
+  // the same hash and forced state.ym back to the saved date's month (arrows did nothing), while the day
+  // pop-up it had auto-opened (with a scroll-lock and full-screen backdrop) swallowed the day taps. Only a
+  // tab switch changed the hash and cleared it. Fix: a ?date= deep link is consumed ONCE (state set, hash
+  // normalised to '#calendar') and never auto-opens a pop-up; saving now sets state directly and goes to
+  // plain '#calendar'.
   function renderCalendar(params) {
-    // Only auto-open the day pop-up when navigated here with an explicit ?date= (e.g. right after
-    // saving/deleting a record). Landing on the Calendar tab normally should not pop the sheet open.
-    calState.modalOpen = !!(params && params.date);
     if (params && params.date) {
       var pym = params.date.slice(0, 7);
       state.ym = pym;
       calState.selectedByYm[pym] = params.date;
-      if (calState.modalOpen) { calState.modalOpenedFor = null; lockBodyScroll(true); }
-      else lockBodyScroll(false);
-    } else {
-      lockBodyScroll(false);
+      try { history.replaceState(null, '', location.pathname + location.search + '#calendar'); } catch (e) { /* ignore */ }
     }
+    calState.modalOpen = false;
+    tuePlanState.open = false;
+    paintCalendar();
+  }
+
+  // Computes the month locally (no request) and draws it. Keeps any open pop-up / planner state.
+  function paintCalendar() {
     var ym = state.ym;
-    app.innerHTML = shellSkeleton(ymLabel(ym), 'calendar');
-    getMonth(ym).then(function (month) {
-      var sel = calState.selectedByYm[ym];
-      if (!sel) {
-        sel = (ym === state.today.slice(0, 7)) ? state.today : (ym + '-01');
-        calState.selectedByYm[ym] = sel;
-      }
-      drawCalendar(month, sel, ym);
-      prefetchAdjacentMonths(ym);
-      lsSetJSON('sl_last_month', { ym: ym, month: month });
-    });
+    var sel = calState.selectedByYm[ym];
+    if (!sel) {
+      sel = (ym === state.today.slice(0, 7)) ? state.today : (ym + '-01');
+      calState.selectedByYm[ym] = sel;
+    }
+    syncBodyScrollLock();
+    drawCalendar(localMonth(ym), sel, ym);
   }
 
   function drawCalendar(month, sel, ym) {
@@ -468,14 +572,14 @@
     }
     var legend =
       '<div class="legend">' +
-      '<span class="item"><span class="chip st-base">MOST</span>ตามเวร</span>' +
-      '<span class="item"><span class="chip st-abs">MOST</span>ขาด</span>' +
-      '<span class="item"><span class="chip st-sub">Dao</span>เข้าแทน</span>' +
-      '<span class="item"><span class="chip st-adh">Tong</span>AdHoc</span>' +
-      '<span class="item"><span class="chip st-swi">Bomb</span>สลับ</span>' +
-      '<span class="item"><span class="chip st-emg">Dook</span>ลาฉุกเฉิน</span>' +
+      '<span class="item"><span class="chip st-base">ชื่อ</span>ตามเวร</span>' +
+      '<span class="item"><span class="chip st-abs">ชื่อ</span>ขาด</span>' +
+      '<span class="item"><span class="chip st-sub">ชื่อ</span>เข้าแทน</span>' +
+      '<span class="item"><span class="chip st-adh">ชื่อ</span>AdHoc</span>' +
+      '<span class="item"><span class="chip st-swi">ชื่อ</span>สลับ</span>' +
+      '<span class="item"><span class="chip st-emg">ชื่อ</span>ลาฉุกเฉิน</span>' +
       '<span class="item"><span class="chip st-tmp">คนนอก</span>คนนอกเข้าแทน</span>' +
-      '<span class="item"><span class="chip st-base slot">Ai</span>ช่องอังคาร</span>' +
+      '<span class="item"><span class="chip st-base slot">ชื่อ</span>ช่องอังคาร</span>' +
       '</div>';
 
     var calmodeHtml = '<div class="calmode-row">' +
@@ -526,10 +630,12 @@
     actions.deleteEvent = function (el) {
       var id = el.getAttribute('data-id');
       if (!window.confirm('ลบเหตุการณ์นี้ใช่หรือไม่')) return;
-      api('deleteEvent', { event_id: id }).then(function () {
-        invalidateMonth(ym);
+      write('deleteEvent', { event_id: id }).then(function () {
         toast('ลบแล้ว');
-        renderCalendar({});
+        syncCalendarBg(id);
+        calState.modalOpen = false;
+        syncBodyScrollLock();
+        paintCalendar();
       });
     };
     // P7 §4.3.1/§4.3.3: monthly Tuesday planner — opened from the button above the grid or from
@@ -543,11 +649,12 @@
     };
     actions.saveTuePlan = function (el) {
       var slots = Object.keys(tuePlanState.choices).map(function (date) { return { date: date, person_id: tuePlanState.choices[date] }; });
-      withSavingButton(el, function () { return api('setTueSlots', { ym: tuePlanState.ym, slots: slots }).then(function () {
-        invalidateMonth(tuePlanState.ym);
+      withSavingButton(el, function () { return write('setTueSlots', { ym: tuePlanState.ym, slots: slots }).then(function () {
         tuePlanState.open = false;
+        calState.modalOpen = false;
+        syncBodyScrollLock();
         toast('บันทึกช่องอังคารแล้ว');
-        renderCalendar({});
+        paintCalendar();
       }); });
     };
     if (calState.modalOpen) bindDayModalEsc();
@@ -580,29 +687,20 @@
     lockBodyScroll(tuePlanState.open || calState.modalOpen);
   }
 
-  function redrawCalendarNow() {
-    var ym = state.ym;
-    var month = state.monthCache[ym];
-    var sel = calState.selectedByYm[ym];
-    if (month) drawCalendar(month, sel, ym);
-  }
-
+  // P8: the planner is computed locally (Logic.tuePlan over the bundle) - it opens instantly.
   function openTuePlanner(ym) {
     tuePlanState.open = true;
     tuePlanState.ym = ym;
-    tuePlanState.plan = null;
     tuePlanState.choices = {};
     tuePlanState.originalUnassigned = {};
-    syncBodyScrollLock();
-    redrawCalendarNow();
-    api('tuePlan', { ym: ym }).then(function (plan) {
-      tuePlanState.plan = plan;
-      plan.days.forEach(function (d) {
-        tuePlanState.choices[d.date] = d.person_id || '0005';
-        tuePlanState.originalUnassigned[d.date] = !d.person_id;
-      });
-      redrawCalendarNow();
+    var plan = window.tuePlan(ym, state.bundle, state.tueAllowed);
+    tuePlanState.plan = plan;
+    plan.days.forEach(function (d) {
+      tuePlanState.choices[d.date] = d.person_id || defaultTueId();
+      tuePlanState.originalUnassigned[d.date] = !d.person_id;
     });
+    syncBodyScrollLock();
+    paintCalendar();
   }
 
   function buildTuePlannerModal() {
@@ -619,7 +717,7 @@
     } else {
       bodyHtml = plan.days.map(function (d) {
         var choice = tuePlanState.choices[d.date];
-        var isDefault = tuePlanState.originalUnassigned[d.date] && choice === '0005';
+        var isDefault = tuePlanState.originalUnassigned[d.date] && choice === defaultTueId();
         var opts = d.options.concat([{ person_id: '', nick: 'ไม่จัด', amount: 0, label: '' }]);
         var segHtml = opts.map(function (o) {
           var label = o.person_id === '' ? 'ไม่จัด' : o.nick;
@@ -663,6 +761,7 @@
       if (p && p.group === 'director') tags.push('กรรมการ');
       if (r.slot === 'tue') tags.push('ช่องอังคาร');
       if (r.slot === 'alt') tags.push('ศุกร์เว้นศุกร์');
+      if (r.off_schedule) tags.push('นอกตาราง');
       var label = STATUS_LABEL[r.status] || r.status;
       var cls = STATUS_PILLCLS[r.status] || 'pill p-base';
       return '<div class="detail-row"><div><span style="font-size:14px;font-weight:500">' + esc(name) + '</span> <span style="font-size:12px;color:#7A7064">' + esc(tags.join(' · ')) + '</span></div><span class="' + cls + '">' + esc(label) + '</span></div>';
@@ -682,7 +781,7 @@
         var meta = 'บันทึกโดย ' + esc(e.recorded_by) + ' · ' + esc(fmtDT(e.recorded_at));
         if (e.updated_by) meta += ' · แก้โดย ' + esc(e.updated_by);
         if (e.note) meta += ' · ' + esc(e.note);
-        meta += ' · ' + (e.cal_status === 'ok' ? 'ส่งเข้า Calendar แล้ว' : '⚠️ ยังไม่เข้า Calendar');
+        meta += ' · ' + (e.cal_status === 'ok' ? 'ส่งเข้า Calendar แล้ว' : (e.cal_status === 'pending' ? 'กำลังส่งเข้า Calendar…' : '⚠️ ยังไม่เข้า Calendar'));
         // P6 §4.4.3: hide edit/delete based on the EVENT's own pay period being closed, not the day's month.
         var editDelete = e.pay_closed ? '' :
           '<div style="display:flex;gap:14px;margin-top:8px">' +
@@ -734,6 +833,17 @@
       '</div></div>';
   }
 
+  // After a save/delete: put the calendar on that date's month with that date selected, no pop-up, and
+  // a plain '#calendar' hash (see the root-cause note on renderCalendar).
+  function showCalendarOn(date) {
+    state.ym = date.slice(0, 7);
+    calState.selectedByYm[state.ym] = date;
+    calState.modalOpen = false;
+    tuePlanState.open = false;
+    lockBodyScroll(false);
+    if (location.hash === '#calendar') route(); else navigate('#calendar');
+  }
+
   // ================= RECORD =================
   var recState = {};
   function resetRecState(prefillDate, editingEvent) {
@@ -744,7 +854,8 @@
       adhocPerson: '', swapA: '', swapB: '', note: '', eventId: '', saved: false, savedCalNote: '',
       dayRoster: [], dayRoster2: [],
       payPeriodChoice: 'event', dateMonthClosed: false,
-      preview: { title: '', money: [], errors: [], warnings: [] }, previewTimer: null
+      offSchedule: false, deductMode: 'adhoc', // P8 section 4.4: off-schedule absence
+      preview: { title: '', money: [], errors: [], warnings: [] }
     };
     if (editingEvent) {
       var e = editingEvent;
@@ -758,6 +869,10 @@
       recState.payPeriodChoice = (e.pay_period && e.pay_period !== e.date.slice(0, 7)) ? 'next' : 'event';
       if (e.type === 'absent' || e.type === 'emergency') {
         recState.absentee = e.person_id;
+        if (e.off_schedule) {
+          recState.offSchedule = true;
+          recState.deductMode = e.deduct_mode === 'absent' ? 'absent' : 'adhoc';
+        }
         if (e.person2_id) {
           var subP = personById(e.person2_id);
           if (subP && subP.group === 'temp') { recState.subMode = 'outside'; recState.tempSub = e.person2_id; }
@@ -772,63 +887,51 @@
     }
   }
 
-  function findCachedEvent(id) {
-    for (var ym in state.monthCache) {
-      var month = state.monthCache[ym];
-      for (var i = 0; i < month.days.length; i++) {
-        var day = month.days[i];
-        for (var j = 0; j < day.events.length; j++) {
-          if (day.events[j].event_id === id) return day.events[j];
-        }
-      }
-    }
-    return null;
-  }
-
   function renderRecord(params) {
-    app.innerHTML = shellSkeleton('บันทึกเหตุการณ์', 'record');
     var prefDate = params.date || state.today;
     if (params.event_id) {
-      var found = findCachedEvent(params.event_id);
-      if (found) {
-        resetRecState(found.date, found);
-        loadRosterAndDraw();
-      } else {
-        getMonth(prefDate.slice(0, 7)).then(function (month) {
-          var ev = null;
-          month.days.forEach(function (day) { day.events.forEach(function (e) { if (e.event_id === params.event_id) ev = e; }); });
-          resetRecState(ev ? ev.date : prefDate, ev);
-          loadRosterAndDraw();
-        });
-      }
+      var found = findEvent(params.event_id);
+      resetRecState(found ? found.date : prefDate, found);
     } else {
       resetRecState(prefDate, null);
       if (params.type) recState.type = params.type;
-      loadRosterAndDraw();
     }
+    loadRosterAndDraw();
+  }
+
+  // P8: rosters come from Logic.dayRoster over the local bundle (no request). While editing, the event
+  // itself is left out (same as the validation does) so its own effect does not hide the absentee/sub.
+  function rosterFor(date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return [];
+    var data = recState.eventId ? window.cloneDataWithoutEvent(state.bundle, recState.eventId) : state.bundle;
+    return window.dayRoster(date, data).roster;
   }
 
   function loadRosterAndDraw() {
-    var ym = recState.date.slice(0, 7);
-    getMonth(ym).then(function (month) {
-      var day = month.days[Number(recState.date.slice(8, 10)) - 1];
-      recState.dayRoster = day ? day.roster : [];
-      recState.dateMonthClosed = !!month.closed; // P6: drives the "คิดเงินงวด" field
-      if (recState.type === 'swap' && recState.date2) {
-        getMonth(recState.date2.slice(0, 7)).then(function (month2) {
-          var day2 = month2.days[Number(recState.date2.slice(8, 10)) - 1];
-          recState.dayRoster2 = day2 ? day2.roster : [];
-          drawRecord();
-          schedulePreview();
-        });
-      } else {
-        drawRecord();
-        schedulePreview();
-      }
-    });
+    recState.dayRoster = rosterFor(recState.date);
+    recState.dateMonthClosed = /^\d{4}-\d{2}-\d{2}$/.test(recState.date || '') && window.isClosedYm(recState.date.slice(0, 7), state.bundle.periods); // P6: drives the "คิดเงินงวด" field
+    recState.dayRoster2 = (recState.type === 'swap' && recState.date2) ? rosterFor(recState.date2) : [];
+    refreshRecord();
+  }
+
+  // Background bundle refresh while on the Record tab: re-derive rosters + preview from the new data,
+  // but do not redraw the form under the user's fingers while they are typing.
+  function refreshRecordFromBundle() {
+    if (!recState || !recState.date) return;
+    var t = document.activeElement && document.activeElement.tagName;
+    if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') {
+      recState.dayRoster = rosterFor(recState.date);
+      recState.dayRoster2 = (recState.type === 'swap' && recState.date2) ? rosterFor(recState.date2) : [];
+      computePreview();
+      updatePreviewDom();
+      return;
+    }
+    loadRosterAndDraw();
   }
 
   function absenteeOptions(roster) {
+    // P8 section 4.4: an off-schedule absentee has no shift that day -> any active director/staff.
+    if (recState.type === 'absent' && recState.offSchedule) return activeDirectorsStaff();
     return roster.filter(function (r) { return r.id && ['base', 'swi', 'sub'].indexOf(r.status) !== -1; })
       .map(function (r) { return personById(r.id); }).filter(Boolean);
   }
@@ -836,6 +939,7 @@
   function recRequiredOk() {
     if (recState.type === 'absent' || recState.type === 'emergency') {
       if (!recState.absentee || !recState.date) return false;
+      if (recState.type === 'absent' && recState.offSchedule) return recState.deductMode === 'adhoc' || recState.deductMode === 'absent';
       if (recState.subMode === 'outside' && !recState.tempSub) return false;
       if (recState.subMode === 'team' && !recState.teamSub) return false;
       return true;
@@ -862,7 +966,15 @@
     ev.note = recState.note || '';
     var payPeriod = payPeriodPayloadFor(recState.type);
     if (payPeriod !== undefined) ev.pay_period = payPeriod;
-    if (recState.type === 'absent' || recState.type === 'emergency') {
+    if (recState.type === 'absent' && recState.offSchedule) {
+      ev.person_id = recState.absentee;
+      ev.portion = recState.portion;
+      ev.date2 = '';
+      ev.person2_id = '';
+      ev.sub_pay = '';
+      ev.off_schedule = true;
+      ev.deduct_mode = recState.deductMode;
+    } else if (recState.type === 'absent' || recState.type === 'emergency') {
       ev.person_id = recState.absentee;
       ev.portion = recState.portion;
       ev.date2 = '';
@@ -893,20 +1005,21 @@
     return ev;
   }
 
-  function schedulePreview() {
-    if (recState.previewTimer) clearTimeout(recState.previewTimer);
-    recState.previewTimer = setTimeout(function () {
-      if (!recRequiredOk()) {
-        recState.preview = { title: '', money: [], errors: [], warnings: [] };
-        updatePreviewDom();
-        return;
-      }
-      api('preview', { event: buildEventPayload() }).then(function (res) {
-        recState.preview = res;
-        updatePreviewDom();
-      }).catch(function () { /* toast already shown */ });
-    }, 400);
+  // P8: the preview is computed in the browser with the same Logic.previewEvent the server runs on save
+  // (the server still re-validates every write), so it is instant - no debounce, no request.
+  function computePreview() {
+    if (!recRequiredOk()) {
+      recState.preview = { title: '', money: [], errors: [], warnings: [] };
+      return;
+    }
+    try {
+      recState.preview = window.previewEvent(buildEventPayload(), state.bundle, recState.eventId || undefined);
+    } catch (err) {
+      recState.preview = { title: '', money: [], errors: [err.message], warnings: [] };
+    }
   }
+  function schedulePreview() { computePreview(); updatePreviewDom(); } // note typing: refresh only the preview area
+  function refreshRecord() { computePreview(); drawRecord(); }         // anything that changes the form layout
 
   function previewSaveHtml() {
     var pv = recState.preview;
@@ -957,9 +1070,13 @@
       (recState.type === 'emergency' ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">ลาแบบบริษัทยังจ่ายเงิน (ไม่หักเงิน)</div>' : '');
 
     var absentHtml = '';
+    var isOff = recState.type === 'absent' && recState.offSchedule;
     if (recState.type === 'absent' || recState.type === 'emergency') {
       var absOpts = absenteeOptions(roster);
       var label = recState.type === 'emergency' ? 'ใครลาฉุกเฉิน' : 'ใครขาด';
+      if (recState.type === 'absent') {
+        absentHtml += '<label class="checkbox-row"><input type="checkbox" data-onchange="setOffSchedule" ' + (isOff ? 'checked' : '') + '>ขาดนอกตาราง (ไม่มีเวรวันนั้น)</label>';
+      }
       absentHtml += '<div class="lbl">' + label + '</div><div class="opt-row">' + absOpts.map(function (p) {
         return '<button type="button" class="opt' + (p.id === recState.absentee ? ' opt-on' : '') + '" data-act="setAbsentee" data-id="' + p.id + '">' + esc(p.nick) + '</button>';
       }).join('') + '</div>';
@@ -969,10 +1086,17 @@
         '<button type="button" class="sg' + (recState.portion === 0.5 ? ' sg-on' : '') + '" data-act="setPortion" data-p="0.5">ครึ่งวัน</button>' +
         '</div>';
 
+      if (isOff) {
+        absentHtml += '<div class="lbl">หักเท่า</div><div class="seg seg-2">' +
+          '<button type="button" class="sg' + (recState.deductMode === 'adhoc' ? ' sg-on' : '') + '" data-act="setDeductMode" data-m="adhoc">เรท AdHoc</button>' +
+          '<button type="button" class="sg' + (recState.deductMode === 'absent' ? ' sg-on' : '') + '" data-act="setDeductMode" data-m="absent">เรทขาดปกติ</button>' +
+          '</div>' +
+          '<div style="font-size:12px;color:#6B6257;margin-top:4px">ใช้เมื่อคนนี้ไม่มีเวรวันนั้น (เช่น จ่ายเป็น AdHoc ไปแล้วแต่ไม่ได้มา) · ไม่มีคนเข้าแทน · ไม่นับเป็นวันตามตาราง</div>';
+      } else {
       absentHtml += '<div class="lbl">คนเข้าแทน</div><div class="seg seg-3">' +
-        '<button type="button" class="sg' + (recState.subMode === 'none' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="none">ไม่มี</button>' +
         '<button type="button" class="sg' + (recState.subMode === 'team' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="team">ทีมงาน</button>' +
         '<button type="button" class="sg' + (recState.subMode === 'outside' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="outside">คนนอก</button>' +
+        '<button type="button" class="sg' + (recState.subMode === 'none' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="none">ไม่มี</button>' +
         '</div>';
 
       if (recState.subMode === 'team') {
@@ -1000,10 +1124,12 @@
           '<div><label for="tname" style="font-size:11px;font-weight:600;color:#6B6257">ชื่อใหม่</label><input id="tname" data-oninput="setNewTempNick" value="' + esc(recState.newTempNick) + '" placeholder="ชื่อเล่น" style="width:100%;height:42px;margin-top:4px"></div>' +
           '<div><label for="trate" style="font-size:11px;font-weight:600;color:#6B6257">ค่าแรง/วัน</label><input id="trate" data-oninput="setNewTempRate" inputmode="numeric" value="' + esc(recState.newTempRate) + '" style="width:100%;height:42px;margin-top:4px"></div>' +
           '</div>' +
-          '<label class="checkbox-row"><input type="checkbox" data-onchange="setNewTempRegular" ' + (recState.newTempRegular ? 'checked' : '') + '>เก็บไว้เป็นคนประจำ</label>' +
+          '<label class="checkbox-row"><input type="checkbox" data-onchange="setNewTempRegular" ' + (recState.newTempRegular ? 'checked' : '') + '>บันทึกชื่อไว้ให้เลือกครั้งหน้า</label>' +
+          '<div style="font-size:12px;color:#6B6257;margin-top:2px">ไม่ติ๊ก = ใช้ครั้งเดียว ชื่อจะไม่ขึ้นในรายการครั้งถัดไป (ข้อมูลเก่ายังอยู่)</div>' +
           '<button type="button" class="btn-outline" style="margin-top:10px" data-act="addTempPerson">+ เพิ่มคนนอก</button>' +
           '</div>';
       }
+      } // end !isOff (substitute section)
     }
 
     var swapHtml = '';
@@ -1049,7 +1175,7 @@
       }
     }
 
-    var noteHtml = '<label class="lbl" for="recNote">หมายเหตุ (ไม่บังคับ)</label><textarea id="recNote" rows="2" data-oninput="setNote" placeholder="แจ้งตอน 10 โมง ไม่สบาย" style="width:100%">' + esc(recState.note) + '</textarea>';
+    var noteHtml = '<label class="lbl" for="recNote">' + (isOff ? 'หมายเหตุ (แนะนำให้ใส่)' : 'หมายเหตุ (ไม่บังคับ)') + '</label><textarea id="recNote" rows="2" data-oninput="setNote" placeholder="' + (isOff ? 'เช่น จ่าย AdHoc 12 ก.ย. ไปแล้วแต่ไม่ได้มา' : 'แจ้งตอน 10 โมง ไม่สบาย') + '" style="width:100%">' + esc(recState.note) + '</textarea>';
 
     app.innerHTML =
       '<div class="shell">' +
@@ -1067,51 +1193,57 @@
 
     actions.setType = function (el) {
       recState.type = el.getAttribute('data-type');
+      if (recState.type !== 'absent') recState.offSchedule = false; // off-schedule is an absence-only option
       loadRosterAndDraw();
     };
-    actions.setPayPeriodChoice = function (el) { recState.payPeriodChoice = el.getAttribute('data-c'); drawRecord(); schedulePreview(); };
+    actions.setOffSchedule = function (el) {
+      recState.offSchedule = !!el.checked;
+      recState.absentee = '';        // the candidate list changes (roster vs everyone)
+      recState.subMode = 'none'; recState.teamSub = ''; recState.tempSub = '';
+      if (recState.offSchedule && recState.deductMode !== 'absent') recState.deductMode = 'adhoc';
+      refreshRecord();
+    };
+    actions.setDeductMode = function (el) { recState.deductMode = el.getAttribute('data-m'); refreshRecord(); };
+    actions.setPayPeriodChoice = function (el) { recState.payPeriodChoice = el.getAttribute('data-c'); refreshRecord(); };
     actions.setDate = function (el) { recState.date = el.value; loadRosterAndDraw(); };
     actions.setDate2 = function (el) { recState.date2 = el.value; loadRosterAndDraw(); };
-    actions.setAbsentee = function (el) { recState.absentee = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
-    actions.setPortion = function (el) { recState.portion = Number(el.getAttribute('data-p')); drawRecord(); schedulePreview(); };
-    actions.setSubMode = function (el) { recState.subMode = el.getAttribute('data-m'); drawRecord(); schedulePreview(); };
-    actions.setTeamSub = function (el) { recState.teamSub = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
-    actions.setPayMode = function (el) { recState.payMode = el.getAttribute('data-m'); drawRecord(); schedulePreview(); };
-    actions.setTempSub = function (el) { recState.tempSub = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
+    actions.setAbsentee = function (el) { recState.absentee = el.getAttribute('data-id'); refreshRecord(); };
+    actions.setPortion = function (el) { recState.portion = Number(el.getAttribute('data-p')); refreshRecord(); };
+    actions.setSubMode = function (el) { recState.subMode = el.getAttribute('data-m'); refreshRecord(); };
+    actions.setTeamSub = function (el) { recState.teamSub = el.getAttribute('data-id'); refreshRecord(); };
+    actions.setPayMode = function (el) { recState.payMode = el.getAttribute('data-m'); refreshRecord(); };
+    actions.setTempSub = function (el) { recState.tempSub = el.getAttribute('data-id'); refreshRecord(); };
     actions.setNewTempNick = function (el) { recState.newTempNick = el.value; };
     actions.setNewTempRate = function (el) { recState.newTempRate = el.value; };
     actions.setNewTempRegular = function (el) { recState.newTempRegular = el.checked; };
     actions.addTempPerson = function (el) {
       var nick = (recState.newTempNick || '').trim();
       if (!nick) { toast('กรุณาใส่ชื่อคนนอก'); return; }
-      withSavingButton(el, function () { return api('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular }).then(function (person) {
-        return api('bootstrap', {}).then(function (data) { state.people = data.people; return person; });
-      }).then(function (person) {
+      withSavingButton(el, function () { return write('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular }).then(function (person) {
         recState.tempSub = person.id;
         recState.newTempNick = ''; recState.newTempRate = 625; recState.newTempRegular = true;
-        drawRecord(); schedulePreview();
+        refreshRecord();
       }); });
     };
-    actions.setSwapA = function (el) { recState.swapA = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
-    actions.setSwapB = function (el) { recState.swapB = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
-    actions.setAdhocPerson = function (el) { recState.adhocPerson = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
+    actions.setSwapA = function (el) { recState.swapA = el.getAttribute('data-id'); refreshRecord(); };
+    actions.setSwapB = function (el) { recState.swapB = el.getAttribute('data-id'); refreshRecord(); };
+    actions.setAdhocPerson = function (el) { recState.adhocPerson = el.getAttribute('data-id'); refreshRecord(); };
     actions.setNote = function (el) { recState.note = el.value; schedulePreview(); };
     actions.saveRecord = function (el) {
       var ev = buildEventPayload();
-      withSavingButton(el, function () { return api('saveEvent', { event: ev }).then(function (res) {
-        invalidateMonth(ev.date.slice(0, 7));
-        if (ev.date2) invalidateMonth(ev.date2.slice(0, 7));
-        calState.selectedByYm[ev.date.slice(0, 7)] = ev.date;
-        toast('บันทึกแล้ว' + (res.cal_status === 'ok' ? '' : ' · Calendar ยังไม่ซิงก์'));
-        navigate('#calendar?date=' + ev.date);
+      withSavingButton(el, function () { return write('saveEvent', { event: ev }).then(function (res) {
+        toast('บันทึกแล้ว');
+        showCalendarOn(ev.date);
+        syncCalendarBg(res.event.event_id); // P8: Calendar is synced in the background, after the save
       }); });
     };
     actions.deleteRecord = function (el) {
       if (!window.confirm('ลบเหตุการณ์นี้ใช่หรือไม่')) return;
-      withSavingButton(el, function () { return api('deleteEvent', { event_id: recState.eventId }).then(function () {
-        invalidateMonth(recState.date.slice(0, 7));
+      var delId = recState.eventId, delDate = recState.date;
+      withSavingButton(el, function () { return write('deleteEvent', { event_id: delId }).then(function () {
         toast('ลบแล้ว');
-        navigate('#calendar');
+        showCalendarOn(delDate);
+        syncCalendarBg(delId);
       }); });
     };
   }
@@ -1123,8 +1255,7 @@
   var COL_LABEL = { sch: 'เวร', wrk: 'มาจริง', att: '% มา', abs: 'ขาด', emg: 'ลา<br>ฉุกเฉิน', sub: 'เข้าแทน', adh: 'AdHoc', swp: 'สลับ' };
 
   function renderStats() {
-    app.innerHTML = shellSkeleton('สถิติ', 'stats');
-    api('stats', { ym: state.ym }).then(function (stats) { drawStats(stats); });
+    drawStats(localStats(state.ym)); // P8: computed locally, no request
   }
 
   function drawStats(stats) {
@@ -1210,8 +1341,7 @@
 
   // ================= PAYOUT =================
   function renderPayout() {
-    app.innerHTML = shellSkeleton('สรุปเงิน', 'payout');
-    api('payout', { ym: state.ym }).then(function (payout) { drawPayout(payout); });
+    drawPayout(localPayout(state.ym)); // P8: computed locally (tempPaid + closed come from the bundle)
   }
 
   function drawPayout(payout) {
@@ -1280,7 +1410,7 @@
     actions.nextMonth = function () { shiftMonth(1); };
     actions.togglePaid = function (el) {
       if (payout.closed) return;
-      withSavingButton(el, function () { return api('markTempPaid', { ym: ym, paid: !paid }).then(function () { renderPayout(); }); });
+      withSavingButton(el, function () { return write('markTempPaid', { ym: ym, paid: !paid }).then(function () { renderPayout(); }); });
     };
     actions.downloadCsv = function () {
       var blob = new Blob([payout.csv], { type: 'text/csv;charset=utf-8' });
@@ -1300,15 +1430,18 @@
     tplDraft: null, tplViewEff: '', pwWhich: 'staff', pw1: '', pw2: ''
   };
 
+  // P8: the owner settings screen is built from the local bundle (no 'settings' request); every settings
+  // write returns a fresh bundle, so re-rendering after a write is enough. (The 'settings' action stays on
+  // the server for compatibility.)
   function renderSettings() {
-    app.innerHTML = shellSkeleton('ตั้งค่า', 'settings');
     if (state.role !== 'owner') { drawSettingsStaff(); return; }
     // P5 §4.5: the Tuesday-slot section no longer lives here (moved to Calendar/Record).
-    api('settings', {}).then(function (data) {
-      settingsState.data = data;
-      settingsState.modal = '';
-      drawSettingsOwner();
-    });
+    var b = state.bundle;
+    settingsState.data = {
+      people: b.people, rates: b.rates, templates: b.templates, periods: b.periods,
+      appUsers: state.appUsers, tueAllowed: state.tueAllowed
+    };
+    drawSettingsOwner();
   }
 
   function drawSettingsStaff() {
@@ -1426,7 +1559,7 @@
       '<button type="button" class="btn-primary" style="margin-top:12px" data-act="submitRate">เพิ่มเรทใหม่</button>';
   }
 
-  // Human label for a rate row's condition, e.g. "700 · อ,พ" or "700 · แทน MOST" (P5 §4.6).
+  // Human label for a rate row's condition, e.g. "700 · อ,พ" or "700 · แทน <ชื่อ>" (P5 §4.6).
   function rateConditionLabel(r) {
     var parts = [];
     if (r.weekdays) {
@@ -1560,7 +1693,7 @@
       if (!f.nick) { toast('กรุณาใส่ชื่อเล่น'); return; }
       var payload = { nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
       if (f.id) payload.id = f.id;
-      withSavingButton(el, function () { return api('savePerson', payload).then(function () {
+      withSavingButton(el, function () { return write('savePerson', payload).then(function () {
         toast('บันทึกแล้ว');
         settingsState.modal = '';
         renderSettings();
@@ -1582,11 +1715,10 @@
     actions.submitRate = function (el) {
       var f = settingsState.addRate;
       if (!f.amount || !f.effective_from) { toast('กรุณากรอกจำนวนเงินและวันที่มีผล'); return; }
-      withSavingButton(el, function () { return api('addRate', {
+      withSavingButton(el, function () { return write('addRate', {
         kind: f.kind, person_id: f.person_id || '', amount: Number(f.amount), effective_from: f.effective_from,
         weekdays: (f.weekdays || []).join(','), replaces: f.replaces || ''
       }).then(function () {
-        invalidateAllMonths();
         toast('เพิ่มเรทแล้ว');
         settingsState.addRate = { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' };
         renderSettings();
@@ -1650,11 +1782,10 @@
     actions.saveTemplateForm = function () {
       var draft = settingsState.tplDraft;
       if (!draft.effective_from) { toast('กรุณาเลือกวันมีผล'); return; }
-      api('saveTemplate', {
+      write('saveTemplate', {
         effective_from: draft.effective_from,
         rows: draft.rows.map(function (r, idx) { return { weekday: r.weekday, slot_order: idx, kind: r.kind, person_id: r.person_id || '', persons: r.persons || '', alt_anchor: r.alt_anchor || '' }; })
       }).then(function () {
-        invalidateAllMonths();
         toast('บันทึกแม่แบบแล้ว');
         settingsState.modal = '';
         renderSettings();
@@ -1663,8 +1794,7 @@
     actions.deleteTemplateSet = function (el) {
       var eff = el.getAttribute('data-eff');
       if (!window.confirm('ลบแม่แบบที่มีผลตั้งแต่ ' + eff + ' ใช่หรือไม่')) return;
-      withSavingButton(el, function () { return api('deleteTemplateSet', { effective_from: eff }).then(function () {
-        invalidateAllMonths();
+      withSavingButton(el, function () { return write('deleteTemplateSet', { effective_from: eff }).then(function () {
         toast('ลบแม่แบบแล้ว');
         renderSettings();
       }); });
@@ -1673,7 +1803,7 @@
     actions.closePeriod = function (el) {
       var ym2 = el.getAttribute('data-ym');
       if (!window.confirm('ปิดงวด ' + ym2 + ' แล้วจะแก้ไม่ได้อีก')) return;
-      withSavingButton(el, function () { return api('closePeriod', { ym: ym2 }).then(function () { invalidateMonth(ym2); toast('ปิดงวดแล้ว'); renderSettings(); }); });
+      withSavingButton(el, function () { return write('closePeriod', { ym: ym2 }).then(function () { toast('ปิดงวดแล้ว'); renderSettings(); }); });
     };
     actions.openPwForm = function (el) { openPasswordModal(el.getAttribute('data-which')); };
     actions.setPw1 = function (el) { settingsState.pw1 = el.value; };
@@ -1689,7 +1819,7 @@
       }); });
     };
     actions.resyncCalendar = function (el) {
-      withSavingButton(el, function () { return api('resyncCalendar', {}).then(function (res) { toast('ซิงก์แล้ว: สำเร็จ ' + res.synced + ' · ล้มเหลว ' + res.failed); }); });
+      withSavingButton(el, function () { return api('resyncCalendar', {}).then(function (res) { toast('ซิงก์แล้ว: สำเร็จ ' + res.synced + ' · ล้มเหลว ' + res.failed); refreshBundle(false); }); });
     };
     actions.logout = doLogout;
   }
@@ -1756,7 +1886,7 @@
         '<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" data-onchange="toggleTplTue" data-wd="' + wd + '" ' + (hasTue ? 'checked' : '') + '>ช่องอังคาร (tue_slot)</label>' +
         '<label class="checkbox-row" style="margin-top:6px"><input type="checkbox" data-onchange="toggleTplAlt" data-wd="' + wd + '" ' + (altRow ? 'checked' : '') + '>ศุกร์เว้นศุกร์ (alt)</label>' +
         (altRow ? '<div style="display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:8px;margin-top:6px">' +
-          '<input data-oninput="setTplAltPersons" data-wd="' + wd + '" placeholder="รหัสคน คั่นด้วย , เช่น 0003,0010" value="' + esc(altRow.persons || '') + '" style="height:40px">' +
+          '<input data-oninput="setTplAltPersons" data-wd="' + wd + '" placeholder="รหัสคน 4 หลัก คั่นด้วย ," value="' + esc(altRow.persons || '') + '" style="height:40px">' +
           '<input type="date" data-oninput="setTplAltAnchor" data-wd="' + wd + '" value="' + esc(altRow.alt_anchor || '') + '" style="height:40px">' +
           '</div>' : '') +
         '</div>';
@@ -1788,41 +1918,78 @@
   }
 
   // ================= BOOT =================
-  function boot() {
-    // P5 §4.2: if a previous month view is cached in localStorage, paint it immediately (using the
-    // last-known people list too, so nicks resolve) before the network round-trip completes.
-    var lastMonth = lsGetJSON('sl_last_month'); // { ym, month }
-    var lastPeople = lsGetJSON('sl_last_people');
-    var lastToday = lsGet('sl_last_today');
-    if (lastMonth && lastMonth.ym && lastMonth.month) {
-      state.ym = lastMonth.ym;
-      state.monthCache[lastMonth.ym] = lastMonth.month;
-    }
-    if (lastPeople) state.people = lastPeople;
-    if (lastToday) state.today = lastToday;
+  // P8: applies a bootstrap response (bundle + session info).
+  function applyBootstrap(data) {
+    state.role = data.role; state.who = data.who;
+    state.today = data.today;
+    if (data.appUsers && data.appUsers.length) { state.appUsers = data.appUsers; state.users = data.appUsers; lsSetJSON('sl_users', data.appUsers); }
+    installBundle(data.bundle);
+    persistBundle();
+    lsSet('sl_role', state.role); lsSet('sl_who', state.who);
+    state.refreshedAt = Date.now();
+  }
 
-    if (state.token) {
-      if (lastMonth && state.people.length) route(); // instant paint from cache
-      api('bootstrap', { ym: state.ym || undefined }).then(function (data) {
-        state.role = data.role; state.who = data.who;
-        state.people = data.people; state.appUsers = data.appUsers;
-        state.tueAllowed = data.tueAllowed; state.today = data.today;
-        if (!state.ym) state.ym = state.today.slice(0, 7);
-        state.users = data.appUsers;
-        lsSetJSON('sl_users', state.appUsers);
-        lsSetJSON('sl_last_people', data.people);
-        lsSet('sl_last_today', data.today);
-        lsSet('sl_role', state.role); lsSet('sl_who', state.who);
-        if (data.month) {
-          state.monthCache[data.month.ym] = data.month;
-          lsSetJSON('sl_last_month', { ym: data.month.ym, month: data.month });
-        }
-        route();
-      }).catch(function () { route(); });
-    } else {
+  function showConnectError() {
+    app.innerHTML = '<div class="shell"><main class="app-main"><div style="padding:60px 16px;text-align:center">' +
+      '<div style="font-size:15px;font-weight:600">เชื่อมต่อไม่ได้</div>' +
+      '<div style="font-size:13px;color:#7A7064;margin-top:6px">ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่</div>' +
+      '<button type="button" class="btn-primary" style="margin-top:16px" data-act="retryBoot">ลองใหม่</button>' +
+      '</div></main></div>';
+    actions.retryBoot = function () { boot(); };
+  }
+
+  // Fetches the whole bundle. foreground=true (no local copy yet): loading bar + tap lock.
+  // foreground=false: background refresh - only the small corner spinner; the screen is repainted when
+  // it returns. A result that raced with a write (bundleVer changed) is dropped: the write's bundle is newer.
+  function refreshBundle(foreground) {
+    var ver = state.bundleVer;
+    return api('bootstrap', {}, foreground ? {} : { silent: true, spin: true }).then(function (data) {
+      if (ver !== state.bundleVer) return;
+      applyBootstrap(data);
+      if (foreground) route(); else repaintCurrent();
+    }).catch(function () {
+      if (!state.bundle && state.token) showConnectError();
+    });
+  }
+
+  var logicLoadTried = false;
+  function boot() {
+    // Safety net for a stale cached index.html that predates logic.js: load it once, then start.
+    if (typeof window.monthView !== 'function') {
+      if (logicLoadTried) { showConnectError(); return; }
+      logicLoadTried = true;
+      var sc = document.createElement('script');
+      sc.src = './logic.js';
+      sc.onload = boot;
+      sc.onerror = showConnectError;
+      document.head.appendChild(sc);
+      return;
+    }
+    // legacy P5 caches are superseded by sl_bundle
+    lsDel('sl_last_month'); lsDel('sl_last_people');
+    state.today = bkkToday();
+    if (!state.ym) state.ym = state.today.slice(0, 7);
+
+    if (!state.token) { route(); return; }
+
+    // Instant start: paint from the persisted bundle, then refresh in the background.
+    var cached = lsGetJSON('sl_bundle');
+    if (cached && cached.people && cached.config) {
+      installBundle(cached);
       route();
+      refreshBundle(false);
+    } else {
+      route(); // skeleton
+      refreshBundle(true);
     }
   }
+
+  // Coming back to the app (tab focus / PWA resume): quietly refresh if the data is over a minute old.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && state.token && state.bundle && Date.now() - state.refreshedAt > 60000) {
+      refreshBundle(false);
+    }
+  });
 
   if (location.search.indexOf('mock=1') === -1 && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function () { /* ignore */ });

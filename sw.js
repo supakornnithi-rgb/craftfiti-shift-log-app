@@ -1,11 +1,12 @@
 // sw.js — app-shell cache-first with background refresh. Never touches cross-origin
 // requests (the GAS API and Google Fonts) so the API always goes over the network.
 'use strict';
-var CACHE_NAME = 'shiftlog-v2';
+var CACHE_NAME = 'shiftlog-v3';
 var SHELL_FILES = [
   './',
   './index.html',
   './app.js',
+  './logic.js',
   './styles.css',
   './config.js',
   './manifest.webmanifest',
