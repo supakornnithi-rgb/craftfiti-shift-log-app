@@ -388,7 +388,11 @@
   }
 
   // ================= CALENDAR =================
-  var calState = { selectedByYm: {}, modalOpen: false, tueModalChoice: '', tueModalCurrent: '' };
+  var calState = { selectedByYm: {}, modalOpen: false };
+  // P7 §4.3.1: monthly Tuesday planner state — `choices` holds date -> person_id (unsaved until
+  // "บันทึกทั้งเดือน"), `originalUnassigned` remembers which rows started blank (for the
+  // "ค่าเริ่มต้น" GINK-default badge).
+  var tuePlanState = { open: false, ym: '', plan: null, choices: {}, originalUnassigned: {} };
   var CHANGED_STATUSES = ['abs', 'hab', 'emg', 'sub', 'tmp', 'adh', 'swo', 'swi'];
   var STATUS_LABEL = { base: 'ตามเวร', abs: 'ขาด', hab: 'ขาดครึ่งวัน', sub: 'เข้าแทน', adh: 'AdHoc', swo: 'สลับออก', swi: 'สลับเข้า', emg: 'ลาฉุกเฉิน', tmp: 'คนนอกเข้าแทน' };
   var STATUS_PILLCLS = { base: 'pill p-base', abs: 'pill p-abs', hab: 'pill p-abs', sub: 'pill p-sub', adh: 'pill p-adh', swo: 'pill p-swp', swi: 'pill p-swp', emg: 'pill p-emg', tmp: 'pill p-tmp' };
@@ -479,10 +483,21 @@
       '<button type="button" class="calmode-btn' + (mode === 'all' ? ' calmode-on' : '') + '" data-act="setCalMode" data-mode="all">ทั้งหมด</button>' +
       '</div>';
 
+    // P7 §4.3.1: button above the grid to open the monthly Tuesday planner, with a badge when
+    // any Tuesday of the displayed month is still unassigned.
+    var unassignedTueCount = month.days.filter(function (day) {
+      return weekdayOf(day.date) === 2 && day.tueSlot && !day.tueSlot.person_id;
+    }).length;
+    var tuePlannerBtnHtml = '<button type="button" class="btn-outline" style="margin-bottom:10px;width:100%;display:flex;justify-content:center;align-items:center;gap:8px" data-act="openTuePlanner">' +
+      'จัดช่องอังคาร ' + esc(ymLabel(ym)) +
+      (unassignedTueCount > 0 ? ' <span class="pill" style="background:#FBE1DC;color:#9B1C12">ยังไม่จัด ' + unassignedTueCount + '</span>' : '') +
+      '</button>';
+
     app.innerHTML =
       '<div class="shell">' +
       monthHeaderHtml('', ym) +
       '<main class="app-main">' +
+      tuePlannerBtnHtml +
       calmodeHtml +
       '<div class="cal-grid" style="padding-bottom:4px">' +
       '<div class="cal-dow">จ</div><div class="cal-dow">อ</div><div class="cal-dow">พ</div><div class="cal-dow">พฤ</div><div class="cal-dow">ศ</div><div class="cal-dow">ส</div><div class="cal-dow">อา</div>' +
@@ -492,6 +507,7 @@
       '</main>' +
       navHtml('calendar') +
       (calState.modalOpen ? buildDayModal(month, sel, ym) : '') +
+      (tuePlanState.open ? buildTuePlannerModal() : '') +
       '</div>';
 
     actions.stop = function () { /* no-op: absorbs clicks inside modal sheet */ };
@@ -499,7 +515,6 @@
     actions.pickDay = function (el) {
       calState.selectedByYm[ym] = el.getAttribute('data-date');
       calState.modalOpen = true;
-      calState.modalOpenedFor = null; // force the Tuesday selector to re-init from server state
       lockBodyScroll(true);
       drawCalendar(month, calState.selectedByYm[ym], ym);
     };
@@ -517,10 +532,20 @@
         renderCalendar({});
       });
     };
-    actions.setTueModalChoice = function (el) { calState.tueModalChoice = el.value; };
-    actions.saveTueModalSlot = function (el) {
-      withSavingButton(el, function () { return api('setTueSlot', { date: sel, person_id: calState.tueModalChoice || '' }).then(function () {
-        invalidateMonth(ym);
+    // P7 §4.3.1/§4.3.3: monthly Tuesday planner — opened from the button above the grid or from
+    // the read-only line in the day pop-up.
+    actions.openTuePlanner = function () { openTuePlanner(ym); };
+    actions.openTuePlannerFromDay = function () { calState.modalOpen = false; openTuePlanner(ym); };
+    actions.closeTuePlanner = function () { tuePlanState.open = false; syncBodyScrollLock(); drawCalendar(month, sel, ym); };
+    actions.chooseTue = function (el) {
+      tuePlanState.choices[el.getAttribute('data-date')] = el.getAttribute('data-id');
+      drawCalendar(month, sel, ym);
+    };
+    actions.saveTuePlan = function (el) {
+      var slots = Object.keys(tuePlanState.choices).map(function (date) { return { date: date, person_id: tuePlanState.choices[date] }; });
+      withSavingButton(el, function () { return api('setTueSlots', { ym: tuePlanState.ym, slots: slots }).then(function () {
+        invalidateMonth(tuePlanState.ym);
+        tuePlanState.open = false;
         toast('บันทึกช่องอังคารแล้ว');
         renderCalendar({});
       }); });
@@ -542,6 +567,83 @@
         if (el) el.click();
       }
     });
+  }
+
+  // P7 §4.3.1: monthly Tuesday planner bottom sheet.
+  function tueDateLabel(date) {
+    var d = Number(date.slice(8, 10));
+    var mIdx = Number(date.slice(5, 7)) - 1;
+    return 'อ. ' + d + ' ' + THAI_MONTH_SHORT[mIdx];
+  }
+
+  function syncBodyScrollLock() {
+    lockBodyScroll(tuePlanState.open || calState.modalOpen);
+  }
+
+  function redrawCalendarNow() {
+    var ym = state.ym;
+    var month = state.monthCache[ym];
+    var sel = calState.selectedByYm[ym];
+    if (month) drawCalendar(month, sel, ym);
+  }
+
+  function openTuePlanner(ym) {
+    tuePlanState.open = true;
+    tuePlanState.ym = ym;
+    tuePlanState.plan = null;
+    tuePlanState.choices = {};
+    tuePlanState.originalUnassigned = {};
+    syncBodyScrollLock();
+    redrawCalendarNow();
+    api('tuePlan', { ym: ym }).then(function (plan) {
+      tuePlanState.plan = plan;
+      plan.days.forEach(function (d) {
+        tuePlanState.choices[d.date] = d.person_id || '0005';
+        tuePlanState.originalUnassigned[d.date] = !d.person_id;
+      });
+      redrawCalendarNow();
+    });
+  }
+
+  function buildTuePlannerModal() {
+    var plan = tuePlanState.plan;
+    var ym = tuePlanState.ym;
+    var bodyHtml;
+    if (!plan) {
+      bodyHtml = '<div style="padding:24px 0;text-align:center;color:#7A7064;font-size:13px">กำลังโหลด…</div>';
+    } else if (plan.closed) {
+      bodyHtml = '<div class="warn-box">งวดปิดแล้ว</div>' + plan.days.map(function (d) {
+        var p = d.person_id ? personById(d.person_id) : null;
+        return '<div class="detail-row"><span>' + esc(tueDateLabel(d.date)) + '</span><span>' + esc(p ? p.nick : 'ยังไม่จัด') + '</span></div>';
+      }).join('');
+    } else {
+      bodyHtml = plan.days.map(function (d) {
+        var choice = tuePlanState.choices[d.date];
+        var isDefault = tuePlanState.originalUnassigned[d.date] && choice === '0005';
+        var opts = d.options.concat([{ person_id: '', nick: 'ไม่จัด', amount: 0, label: '' }]);
+        var segHtml = opts.map(function (o) {
+          var label = o.person_id === '' ? 'ไม่จัด' : o.nick;
+          return '<button type="button" class="sg' + (choice === o.person_id ? ' sg-on' : '') + '" data-act="chooseTue" data-date="' + d.date + '" data-id="' + o.person_id + '">' + esc(label) + '</button>';
+        }).join('');
+        var chosenOpt = d.options.find(function (o) { return o.person_id === choice; });
+        var payHint = chosenOpt ?
+          (esc(chosenOpt.nick) + ' · ' + (chosenOpt.label.indexOf('AdHoc') !== -1 ? 'AdHoc' : 'เรทปกติ') + ' +' + money2(chosenOpt.amount)) :
+          'ไม่จัด · ไม่มีผลต่อเงิน';
+        return '<div style="padding:10px 0;border-top:1px solid #F0EAE0">' +
+          '<span style="font-size:13px;font-weight:600">' + esc(tueDateLabel(d.date)) +
+          (isDefault ? ' <span style="font-size:11px;font-weight:400;color:#7A7064">(ค่าเริ่มต้น)</span>' : '') + '</span>' +
+          '<div class="seg seg-4" style="margin-top:6px">' + segHtml + '</div>' +
+          '<div style="font-size:12px;color:#6B6257;margin-top:4px">' + payHint + '</div>' +
+          '</div>';
+      }).join('');
+    }
+    var footer = (plan && !plan.closed) ? '<button type="button" class="btn-primary" style="margin-top:14px;width:100%" data-act="saveTuePlan">บันทึกทั้งเดือน</button>' : '';
+    return '<div class="modal-backdrop" data-act="closeTuePlanner">' +
+      '<div class="modal-sheet" data-act="stop" style="position:relative">' +
+      '<button type="button" class="day-modal-close" data-act="closeTuePlanner" aria-label="ปิด">✕</button>' +
+      '<div style="font-weight:600;font-size:18px;padding-right:36px">จัดช่องอังคาร ' + esc(ymLabel(ym)) + '</div>' +
+      bodyHtml + footer +
+      '</div></div>';
   }
 
   // P5 §4.1: bottom-sheet day pop-up — replaces the old inline day-detail card.
@@ -602,21 +704,18 @@
     // (a late event dated in a closed month is now allowed — its money carries to the next open period).
     var addBtn = '<button type="button" class="btn-secondary" style="margin-top:12px" data-act="addEvent">+ เพิ่มเหตุการณ์วันนี้</button>';
 
-    // P5 §4.5: on Tuesdays the popup also shows the Tuesday-slot selector inline (staff and owner alike).
+    // P7 §4.3.3: on Tuesdays the popup shows a read-only line for the slot (money comes straight
+    // from the API's monthView `tueSlot` field) plus a link that opens the monthly planner.
     var tueHtml = '';
     if (wd === 2) {
-      var slotEntry = day.roster.find(function (r) { return r.slot === 'tue'; });
-      var curId = slotEntry && !slotEntry.unassigned ? slotEntry.id : '';
-      calState.tueModalCurrent = curId;
-      if (calState.modalOpenedFor !== sel) { calState.tueModalChoice = curId; calState.modalOpenedFor = sel; }
-      var tueOpts = state.tueAllowed.map(function (id) { return personById(id); }).filter(Boolean);
-      var tueOptsHtml = '<option value=""' + (calState.tueModalChoice === '' ? ' selected' : '') + '>ยังไม่จัด</option>' +
-        tueOpts.map(function (p) { return '<option value="' + p.id + '"' + (calState.tueModalChoice === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
+      var slotInfo = day.tueSlot || { person_id: '', money: [] };
+      var slotLine = slotInfo.person_id
+        ? (esc(nickOf(slotInfo.person_id)) + (slotInfo.money.length ? ' · ' + esc(slotInfo.money[0].label) : ''))
+        : 'ยังไม่จัด';
       tueHtml = '<div class="tue-ctl">' +
         '<div style="font-size:13px;font-weight:600">ช่องอังคาร</div>' +
-        '<select data-onchange="setTueModalChoice" style="width:100%;height:42px;margin-top:6px">' + tueOptsHtml + '</select>' +
-        '<div style="font-size:11px;color:#6B6257;margin-top:6px">บันทึกว่าอังคารนี้ใครเข้าร้านตามรอบ (ไม่ใช่การขาดหรือ AdHoc · ไม่มีผลต่อเงิน)</div>' +
-        '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="saveTueModalSlot">บันทึกช่องอังคาร</button>' +
+        '<div style="font-size:13px;margin-top:4px">' + slotLine + '</div>' +
+        '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="openTuePlannerFromDay">จัดช่องอังคารทั้งเดือน</button>' +
         '</div>';
     }
 
@@ -643,7 +742,7 @@
       absentee: '', portion: 1, subMode: 'none', teamSub: '', payMode: 'normal',
       tempSub: '', newTempNick: '', newTempRate: 625, newTempRegular: true,
       adhocPerson: '', swapA: '', swapB: '', note: '', eventId: '', saved: false, savedCalNote: '',
-      dayRoster: [], dayRoster2: [], tueChoice: '', tueCurrent: '',
+      dayRoster: [], dayRoster2: [],
       payPeriodChoice: 'event', dateMonthClosed: false,
       preview: { title: '', money: [], errors: [], warnings: [] }, previewTimer: null
     };
@@ -721,13 +820,6 @@
           recState.dayRoster2 = day2 ? day2.roster : [];
           drawRecord();
           schedulePreview();
-        });
-      } else if (recState.type === 'tue' && weekdayOf(recState.date) === 2) {
-        api('tueSlots', { ym: ym }).then(function (rows) {
-          var row = rows.find(function (r) { return r.date === recState.date; });
-          recState.tueCurrent = row ? row.person_id : '';
-          recState.tueChoice = recState.tueCurrent;
-          drawRecord();
         });
       } else {
         drawRecord();
@@ -856,15 +948,13 @@
     var roster = recState.dayRoster || [];
     var rosterNames = roster.filter(function (r) { return r.id; }).map(function (r) { return nickOf(r.id); });
 
-    // P5 §4.4: fixed tab order ขาดงาน, AdHoc, สลับวัน, ลาฉุกเฉิน, ช่องอังคาร (new, §4.5).
-    var isTue = weekdayOf(recState.date) === 2;
-    var typeHtml = '<div class="lbl" style="margin-top:6px">ประเภท</div><div class="seg seg-5">' +
-      [{ k: 'absent', l: 'ขาดงาน' }, { k: 'adhoc', l: 'AdHoc' }, { k: 'swap', l: 'สลับวัน' }, { k: 'emergency', l: 'ลาฉุกเฉิน' }, { k: 'tue', l: 'ช่องอังคาร' }].map(function (t) {
-        var disabled = t.k === 'tue' && !isTue;
-        return '<button type="button" class="sg' + (t.k === recState.type ? ' sg-on' : '') + '" data-act="setType" data-type="' + t.k + '"' + (disabled ? ' disabled' : '') + '>' + t.l + '</button>';
+    // P7 §4.3.2: fixed tab order back to ขาดงาน, AdHoc, สลับวัน, ลาฉุกเฉิน (ช่องอังคาร moved to
+    // the Calendar tab's monthly planner — see openTuePlanner).
+    var typeHtml = '<div class="lbl" style="margin-top:6px">ประเภท</div><div class="seg seg-4">' +
+      [{ k: 'absent', l: 'ขาดงาน' }, { k: 'adhoc', l: 'AdHoc' }, { k: 'swap', l: 'สลับวัน' }, { k: 'emergency', l: 'ลาฉุกเฉิน' }].map(function (t) {
+        return '<button type="button" class="sg' + (t.k === recState.type ? ' sg-on' : '') + '" data-act="setType" data-type="' + t.k + '">' + t.l + '</button>';
       }).join('') + '</div>' +
-      (recState.type === 'emergency' ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">ลาแบบบริษัทยังจ่ายเงิน (ไม่หักเงิน)</div>' : '') +
-      (recState.type === 'tue' && !isTue ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">เลือกได้เฉพาะวันอังคาร</div>' : '');
+      (recState.type === 'emergency' ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">ลาแบบบริษัทยังจ่ายเงิน (ไม่หักเงิน)</div>' : '');
 
     var absentHtml = '';
     if (recState.type === 'absent' || recState.type === 'emergency') {
@@ -959,25 +1049,6 @@
       }
     }
 
-    // P5 §4.5: Tuesday-slot tab (moved from Settings). Editable by staff and owner alike (owner decision override).
-    var tueHtml = '';
-    if (recState.type === 'tue') {
-      if (!isTue) {
-        tueHtml = '<div class="tue-ctl tue-ctl-disabled"><div style="font-size:13px;color:#6B6257">เลือกได้เฉพาะวันอังคาร</div></div>';
-      } else {
-        var tueOpts = state.tueAllowed.map(function (id) { return personById(id); }).filter(Boolean);
-        var tueOptsHtml = '<option value=""' + (recState.tueChoice === '' ? ' selected' : '') + '>ยังไม่จัด</option>' +
-          tueOpts.map(function (p) { return '<option value="' + p.id + '"' + (recState.tueChoice === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
-        tueHtml = '<div class="tue-ctl">' +
-          '<div style="font-size:13px;font-weight:600">อังคาร ' + esc(recState.date) + '</div>' +
-          '<div style="font-size:12px;color:#6B6257;margin-top:2px">ปัจจุบัน: ' + esc(recState.tueCurrent ? nickOf(recState.tueCurrent) : 'ยังไม่จัด') + '</div>' +
-          '<div class="form-row"><label for="tueSel">ใครเข้าร้านตามรอบ</label><select id="tueSel" data-onchange="setTueChoice">' + tueOptsHtml + '</select></div>' +
-          '<div style="font-size:11px;color:#6B6257;margin-top:6px">บันทึกว่าอังคารนี้ใครเข้าร้านตามรอบ (ไม่ใช่การขาดหรือ AdHoc · ไม่มีผลต่อเงิน)</div>' +
-          '<button type="button" class="btn-primary" style="margin-top:12px" data-act="saveTueSlot">บันทึกช่องอังคาร</button>' +
-          '</div>';
-      }
-    }
-
     var noteHtml = '<label class="lbl" for="recNote">หมายเหตุ (ไม่บังคับ)</label><textarea id="recNote" rows="2" data-oninput="setNote" placeholder="แจ้งตอน 10 โมง ไม่สบาย" style="width:100%">' + esc(recState.note) + '</textarea>';
 
     app.innerHTML =
@@ -988,27 +1059,17 @@
       '<label class="lbl" for="recDate" style="margin-top:0">วันที่</label>' +
       '<input type="date" id="recDate" data-oninput="setDate" value="' + esc(recState.date) + '" style="width:100%;height:48px">' +
       '<div style="font-size:12px;color:#6B6257;margin-top:6px">เวรวันนี้: ' + esc(rosterNames.join(' · ') || '—') + '</div>' +
-      typeHtml + absentHtml + swapHtml + adhocHtml + payPeriodHtml + tueHtml +
-      (recState.type === 'tue' ? '' : noteHtml + previewSaveHtml()) +
+      typeHtml + absentHtml + swapHtml + adhocHtml + payPeriodHtml +
+      noteHtml + previewSaveHtml() +
       '</main>' +
       navHtml('record') +
       '</div>';
 
     actions.setType = function (el) {
-      var t = el.getAttribute('data-type');
-      if (t === 'tue' && weekdayOf(recState.date) !== 2) return; // ช่องอังคาร: Tuesday only
-      recState.type = t;
+      recState.type = el.getAttribute('data-type');
       loadRosterAndDraw();
     };
     actions.setPayPeriodChoice = function (el) { recState.payPeriodChoice = el.getAttribute('data-c'); drawRecord(); schedulePreview(); };
-    actions.setTueChoice = function (el) { recState.tueChoice = el.value; };
-    actions.saveTueSlot = function (el) {
-      withSavingButton(el, function () { return api('setTueSlot', { date: recState.date, person_id: recState.tueChoice || '' }).then(function () {
-        invalidateMonth(recState.date.slice(0, 7));
-        toast('บันทึกช่องอังคารแล้ว');
-        navigate('#calendar?date=' + recState.date);
-      }); });
-    };
     actions.setDate = function (el) { recState.date = el.value; loadRosterAndDraw(); };
     actions.setDate2 = function (el) { recState.date2 = el.value; loadRosterAndDraw(); };
     actions.setAbsentee = function (el) { recState.absentee = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
