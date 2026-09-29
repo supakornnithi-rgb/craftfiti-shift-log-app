@@ -443,6 +443,7 @@ function calendarTitle(event, data) {
   }
 
   if (!event.person2_id) {
+    if (event.cover === 'pending') return prefix + ' ' + absentNick + ' รอหาคนแทน' + half;
     return prefix + ' ' + absentNick + ' ไม่มีคนแทน' + half;
   }
 
@@ -499,6 +500,43 @@ function applyPayPeriodChecks_(event, data, editingId, errors) {
   return resolved;
 }
 
+// P9 §4.3 helpers
+function sameEventKey_(a, b) {
+  return a.type === b.type &&
+    (a.date || '') === (b.date || '') &&
+    (a.date2 || '') === (b.date2 || '') &&
+    (a.person_id || '') === (b.person_id || '') &&
+    (a.person2_id || '') === (b.person2_id || '');
+}
+
+function findExactDuplicate_(event, vdata) {
+  return (vdata.events || []).find(function (e) {
+    return e.status !== 'deleted' && sameEventKey_(e, event);
+  }) || null;
+}
+
+function collectSameDayWarnings_(event, vdata, warnings) {
+  var mine = [];
+  if (event.person_id) mine.push(event.person_id);
+  if (event.person2_id) mine.push(event.person2_id);
+  var dates = [event.date];
+  if (event.type === 'swap' && event.date2) dates.push(event.date2);
+  var seen = {};
+  dates.forEach(function (d) {
+    eventsTouching(d, vdata.events).forEach(function (o) {
+      if (o.status === 'deleted') return;
+      if (sameEventKey_(o, event)) return; // exact duplicate: already an error
+      mine.forEach(function (pid) {
+        if (o.person_id !== pid && o.person2_id !== pid) return;
+        var key = pid + '|' + o.event_id;
+        if (seen[key]) return;
+        seen[key] = true;
+        warnings.push(nickOf(pid, vdata) + ' มีรายการอื่นในวันเดียวกันแล้ว: ' + calendarTitle(o, vdata));
+      });
+    });
+  });
+}
+
 function validateEvent(event, data, editingId) {
   var errors = [];
   var warnings = [];
@@ -515,10 +553,21 @@ function validateEvent(event, data, editingId) {
 
   var vdata = cloneDataWithoutEvent(data, editingId);
 
+  // P9 §4.3: exact duplicate guard (same type/date/date2/person/person2 as another active event).
+  var exactDup = !!(event.person_id && event.date && findExactDuplicate_(event, vdata));
+  if (exactDup) {
+    errors.push('บันทึกซ้ำ: มีรายการนี้อยู่แล้ว');
+  }
+  // P9 §4.3: warn when a person already appears in another (non-identical) event on the same date.
+  if (event.date) collectSameDayWarnings_(event, vdata, warnings);
+
   if (event.type === 'absent' || event.type === 'emergency') {
     if (!event.person_id || !event.date) {
       errors.push('กรุณากรอกข้อมูลให้ครบ');
       return { errors: errors, warnings: warnings };
+    }
+    if (event.cover && event.cover !== 'pending' && event.cover !== 'none') {
+      errors.push('สถานะคนแทนไม่ถูกต้อง');
     }
     applyPayPeriodChecks_(event, data, editingId, errors);
     var absentee = personById(event.person_id, data);
@@ -656,6 +705,59 @@ function previewEvent(event, data, editingId) {
   return { title: title, money: money, errors: v.errors, warnings: v.warnings, pay_period: payPeriod, pay_forced: payForced };
 }
 
+// ---------- staffing alerts (P9 section 4.2) ----------
+
+// Effective "cover" of an absent/emergency event: '' has a substitute; 'pending' = waiting for cover;
+// 'none' = no substitute needed. Legacy events (no substitute, blank cover) count as 'none' => no alert.
+function coverOf(event) {
+  if (!event || (event.type !== 'absent' && event.type !== 'emergency')) return '';
+  if (event.person2_id) return '';
+  return event.cover === 'pending' ? 'pending' : 'none';
+}
+
+var WORKING_STATUSES_ = { base: 1, sub: 1, tmp: 1, swi: 1, adh: 1, hab: 1 };
+
+// -> [{kind, message, event_id?}] for one date.
+function dayAlerts(date, data) {
+  var alerts = [];
+  var dr = dayRoster(date, data);
+  var scheduled = baseRoster(date, data);
+  var unassigned = 0;
+  scheduled.forEach(function (r) { if (r.unassigned) unassigned++; });
+
+  var explained = unassigned;
+  dr.events.forEach(function (e) {
+    if (e.status === 'deleted') return;
+    if ((e.type !== 'absent' && e.type !== 'emergency') || e.date !== date) return;
+    if (e.off_schedule || e.person2_id) return;
+    explained++; // this person is out and nobody replaces them: a known reason for the gap
+    if (coverOf(e) === 'pending' && (e.portion || 1) === 1) {
+      alerts.push({ kind: 'pending_cover', message: nickOf(e.person_id, data) + ' ขาด ยังไม่มีคนแทน', event_id: e.event_id });
+    }
+  });
+
+  if (unassigned && weekdayOf(date) === 2) {
+    alerts.push({ kind: 'tue_unassigned', message: 'ช่องอังคารยังไม่ได้จัด' });
+  }
+
+  var working = dr.roster.filter(function (r) { return r.id && WORKING_STATUSES_[r.status]; }).length;
+  var sched = scheduled.length;
+  if (working < sched - explained) {
+    alerts.push({ kind: 'short', message: 'คนไม่ครบ (' + working + '/' + sched + ')' });
+  }
+  return alerts;
+}
+
+// -> [{date, alerts:[...]}] for the days of ym that have alerts.
+function monthAlerts(ym, data) {
+  var out = [];
+  datesOfMonth(ym).forEach(function (d) {
+    var a = dayAlerts(d, data);
+    if (a.length) out.push({ date: d, alerts: a });
+  });
+  return out;
+}
+
 // ---------- monthly aggregates ----------
 
 function monthPayout(ym, data) {
@@ -688,11 +790,23 @@ function monthPayout(ym, data) {
         var tp = personById(line.person_id, data);
         var tnick = tp ? tp.nick : line.person_id;
         if (!tempsMap[line.person_id]) {
-          tempsMap[line.person_id] = { id: line.person_id, nick: tnick, amount: 0, lines: [] };
+          tempsMap[line.person_id] = {
+            id: line.person_id, nick: tnick, bank: (tp && tp.bank) || '', account_no: (tp && tp.account_no) || '',
+            amount: 0, paidAmount: 0, unpaidAmount: 0, lines: [], days: []
+          };
         }
         var tentry = tempsMap[line.person_id];
         tentry.amount = round2(tentry.amount + line.amount);
         tentry.lines.push(label);
+        var isPaid = e.temp_paid === true || e.temp_paid === 'TRUE' || e.temp_paid === 'true';
+        tentry.days.push({
+          event_id: e.event_id, date: e.date,
+          label: 'แทน ' + nickOf(e.person_id, data) + (e.portion === 0.5 ? ' ครึ่งวัน' : ''),
+          amount: line.amount, paid: isPaid,
+          paid_by: isPaid ? (e.temp_paid_by || '') : '', paid_at: isPaid ? (e.temp_paid_at || '') : ''
+        });
+        if (isPaid) tentry.paidAmount = round2(tentry.paidAmount + line.amount);
+        else tentry.unpaidAmount = round2(tentry.unpaidAmount + line.amount);
       }
     });
   });
@@ -724,7 +838,12 @@ function monthPayout(ym, data) {
 
   var totPlus = round2(people.reduce(function (s, p) { return s + p.plus; }, 0));
   var totMinus = round2(people.reduce(function (s, p) { return s + p.minus; }, 0));
+  temps.forEach(function (t) {
+    t.days.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  });
   var tempTotal = round2(temps.reduce(function (s, t) { return s + t.amount; }, 0));
+  var tempPaidTotal = round2(temps.reduce(function (s, t) { return s + t.paidAmount; }, 0));
+  var tempUnpaidTotal = round2(temps.reduce(function (s, t) { return s + t.unpaidAmount; }, 0));
 
   var csvRows = Object.keys(peopleMap)
     .filter(function (id) { var e = peopleMap[id]; return e.plus > 0 || e.minus > 0; })
@@ -737,7 +856,7 @@ function monthPayout(ym, data) {
   var csv = csvLines.join('\n');
   var filename = 'ShiftLog_' + ym + '.csv';
 
-  return { ym: ym, people: people, temps: temps, totPlus: totPlus, totMinus: totMinus, tempTotal: tempTotal, csv: csv, filename: filename, carried: carried };
+  return { ym: ym, people: people, temps: temps, totPlus: totPlus, totMinus: totMinus, tempTotal: tempTotal, tempPaidTotal: tempPaidTotal, tempUnpaidTotal: tempUnpaidTotal, csv: csv, filename: filename, carried: carried };
 }
 
 function monthStats(ym, data) {
@@ -880,6 +999,9 @@ if (typeof module !== 'undefined') {
     monthPayout: monthPayout,
     monthStats: monthStats,
     monthView: monthView,
+    coverOf: coverOf,
+    dayAlerts: dayAlerts,
+    monthAlerts: monthAlerts,
     datesOfMonth: datesOfMonth
   };
 }

@@ -86,6 +86,30 @@
 
   // ---------- toast / loading ----------
   var toastEl = null;
+  // P9 4.1: copy digits to the clipboard (navigator.clipboard, fallback select + execCommand).
+  function copyText(text, done) {
+    function fallback() {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) done(); else toast('คัดลอกไม่สำเร็จ');
+      } catch (e) { toast('คัดลอกไม่สำเร็จ'); }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+  function ddmm(iso) { return iso ? iso.slice(8, 10) + '/' + iso.slice(5, 7) : ''; }
+
   function toast(msg) {
     if (toastEl) { toastEl.remove(); toastEl = null; }
     toastEl = document.createElement('div');
@@ -487,7 +511,7 @@
   }
 
   // ================= CALENDAR =================
-  var calState = { selectedByYm: {}, modalOpen: false };
+  var calState = { selectedByYm: {}, modalOpen: false, alertOpen: false };
   // P7 §4.3.1: monthly Tuesday planner state — `choices` holds date -> person_id (unsaved until
   // "บันทึกทั้งเดือน"), `originalUnassigned` remembers which rows started blank (for the
   // "ค่าเริ่มต้น" default-person badge).
@@ -524,6 +548,7 @@
       try { history.replaceState(null, '', location.pathname + location.search + '#calendar'); } catch (e) { /* ignore */ }
     }
     calState.modalOpen = false;
+    calState.alertOpen = false;
     tuePlanState.open = false;
     paintCalendar();
   }
@@ -542,6 +567,11 @@
 
   function drawCalendar(month, sel, ym) {
     var mode = getCalMode();
+    // P9 4.2: staffing alerts for the displayed month (computed locally with Logic.monthAlerts).
+    var monthAlertList = window.monthAlerts(ym, state.bundle);
+    var alertsByDate = {};
+    var alertCount = 0;
+    monthAlertList.forEach(function (m) { alertsByDate[m.date] = m.alerts; alertCount += m.alerts.length; });
     var firstWd = weekdayOf(ym + '-01');
     var leading = (firstWd + 6) % 7;
     var n = daysInMonth(ym);
@@ -557,24 +587,50 @@
           return CHANGED_STATUSES.indexOf(r.status) !== -1 || (r.slot === 'tue' && r.unassigned);
         });
       }
-      var chips = rosterForCell.map(function (r) {
-        var cls = 'chip st-' + r.status + (r.slot === 'tue' ? ' slot' : '');
-        return '<span class="' + cls + '">' + esc(nickChip(r)) + '</span>';
-      }).join('');
+      function chipHtml(r) {
+        var ccls = 'chip st-' + r.status + (r.slot === 'tue' ? ' slot' : '');
+        return '<span class="' + ccls + '">' + esc(nickChip(r)) + '</span>';
+      }
+      // P9 4.4: in "changed only" mode a day with exactly one absence that has a substitute shows them on
+      // one row "absent -> sub" (wraps to two lines by itself when the cell is too narrow).
+      var pairAbs = null, pairSub = null;
+      if (mode === 'changed') {
+        var subEvents = day.events.filter(function (ev) {
+          return (ev.type === 'absent' || ev.type === 'emergency') && ev.date === date && ev.person2_id && !ev.off_schedule;
+        });
+        if (subEvents.length === 1) {
+          pairAbs = rosterForCell.filter(function (r) { return r.id === subEvents[0].person_id && ['abs', 'hab', 'emg'].indexOf(r.status) !== -1; })[0] || null;
+          pairSub = rosterForCell.filter(function (r) { return r.id === subEvents[0].person2_id && ['sub', 'tmp'].indexOf(r.status) !== -1; })[0] || null;
+        }
+      }
+      var chips = '';
+      rosterForCell.forEach(function (r) {
+        if (pairAbs && pairSub) {
+          if (r === pairAbs) {
+            chips += '<div class="chip-pair">' + chipHtml(pairAbs) + '' + chipHtml(pairSub) + '</div>';
+            return;
+          }
+          if (r === pairSub) return;
+        }
+        chips += chipHtml(r);
+      });
+      var cellAlerts = alertsByDate[date];
       var cls = 'cell' + (date === sel ? ' cell-sel' : '');
       cellsHtml += '<button type="button" class="' + cls + '" data-act="pickDay" data-date="' + date + '" aria-label="' + d + ' ' + esc(THAI_MONTH_FULL[Number(ym.slice(5, 7)) - 1]) + '">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;padding:0 1px">' +
         '<span style="font-size:12px;font-weight:600">' + d + '</span>' +
         (hasEv ? '<span style="width:7px;height:7px;border-radius:50%;background:#B8641A"></span>' : '') +
         '</div>' +
+        (cellAlerts ? '<span class="cell-alert" aria-label="ต้องจัดการ">!</span>' : '') +
         '<div class="cell-chips">' + chips + '</div>' +
         '</button>';
     }
     var legend =
       '<div class="legend">' +
       '<span class="item"><span class="chip st-base">ชื่อ</span>ตามเวร</span>' +
-      '<span class="item"><span class="chip st-abs">ชื่อ</span>ขาด</span>' +
-      '<span class="item"><span class="chip st-sub">ชื่อ</span>เข้าแทน</span>' +
+      '<span class="item"><span class="chip st-abs">ชื่อ</span>ขาด (ขีดฆ่า)</span>' +
+      '<span class="item"><span class="chip st-sub">ชื่อ</span>เข้าแทน (ตัวหนา)</span>' +
+      '<span class="item"><span class="chip st-abs">ชื่อ</span>→<span class="chip st-sub">ชื่อ</span>ขาด → คนแทน</span>' +
       '<span class="item"><span class="chip st-adh">ชื่อ</span>AdHoc</span>' +
       '<span class="item"><span class="chip st-swi">ชื่อ</span>สลับ</span>' +
       '<span class="item"><span class="chip st-emg">ชื่อ</span>ลาฉุกเฉิน</span>' +
@@ -597,10 +653,15 @@
       (unassignedTueCount > 0 ? ' <span class="pill" style="background:#FBE1DC;color:#9B1C12">ยังไม่จัด ' + unassignedTueCount + '</span>' : '') +
       '</button>';
 
+    var alertBtnHtml = alertCount > 0
+      ? '<button type="button" class="alert-btn" data-act="openAlerts">⚠️ ต้องจัดการ ' + alertCount + '</button>'
+      : '';
+
     app.innerHTML =
       '<div class="shell">' +
       monthHeaderHtml('', ym) +
       '<main class="app-main">' +
+      alertBtnHtml +
       tuePlannerBtnHtml +
       calmodeHtml +
       '<div class="cal-grid" style="padding-bottom:4px">' +
@@ -610,8 +671,9 @@
       legend +
       '</main>' +
       navHtml('calendar') +
-      (calState.modalOpen ? buildDayModal(month, sel, ym) : '') +
+      (calState.modalOpen ? buildDayModal(month, sel, ym, alertsByDate[sel] || []) : '') +
       (tuePlanState.open ? buildTuePlannerModal() : '') +
+      (calState.alertOpen ? buildAlertSheet(monthAlertList) : '') +
       '</div>';
 
     actions.stop = function () { /* no-op: absorbs clicks inside modal sheet */ };
@@ -624,6 +686,23 @@
     };
     actions.prevMonth = function () { shiftMonth(-1); };
     actions.nextMonth = function () { shiftMonth(1); };
+    actions.openAlerts = function () { calState.alertOpen = true; syncBodyScrollLock(); drawCalendar(month, sel, ym); };
+    actions.closeAlerts = function () { calState.alertOpen = false; syncBodyScrollLock(); drawCalendar(month, sel, ym); };
+    // Alert actions: find cover -> the event in edit mode with the substitute section focused;
+    // arrange Tuesday -> planner; short -> the day pop-up.
+    actions.alertFindCover = function (el) {
+      calState.alertOpen = false; syncBodyScrollLock();
+      navigate('#record?date=' + el.getAttribute('data-date') + '&event_id=' + encodeURIComponent(el.getAttribute('data-id')) + '&focus=sub');
+    };
+    actions.alertTuePlanner = function () { calState.alertOpen = false; openTuePlanner(ym); };
+    actions.alertViewDay = function (el) {
+      var dt = el.getAttribute('data-date');
+      calState.alertOpen = false;
+      calState.selectedByYm[ym] = dt;
+      calState.modalOpen = true;
+      lockBodyScroll(true);
+      drawCalendar(month, dt, ym);
+    };
     actions.closeDayModal = function () { calState.modalOpen = false; lockBodyScroll(false); drawCalendar(month, sel, ym); };
     actions.addEvent = function () { navigate('#record?date=' + sel); };
     actions.editEvent = function (el) { navigate('#record?date=' + sel + '&event_id=' + encodeURIComponent(el.getAttribute('data-id'))); };
@@ -684,7 +763,7 @@
   }
 
   function syncBodyScrollLock() {
-    lockBodyScroll(tuePlanState.open || calState.modalOpen);
+    lockBodyScroll(tuePlanState.open || calState.modalOpen || calState.alertOpen);
   }
 
   // P8: the planner is computed locally (Logic.tuePlan over the bundle) - it opens instantly.
@@ -744,9 +823,46 @@
       '</div></div>';
   }
 
+  // P9 4.2: the "needs attention" sheet. Today and future days first, past days under "ที่ผ่านมา".
+  function alertDayLabel(date) {
+    return THAI_WEEKDAY_FULL[weekdayOf(date)] + ' ' + Number(date.slice(8, 10)) + ' ' + THAI_MONTH_SHORT[Number(date.slice(5, 7)) - 1];
+  }
+  function alertItemHtml(date, a) {
+    var btn = '';
+    if (a.kind === 'pending_cover') {
+      var ev = a.event_id ? findEvent(a.event_id) : null;
+      var closed = ev && window.isClosedYm(window.payPeriodOf(ev), state.bundle.periods);
+      if (!closed) btn = '<button type="button" class="btn-outline" data-act="alertFindCover" data-date="' + date + '" data-id="' + esc(a.event_id) + '">หาคนแทน</button>';
+    } else if (a.kind === 'tue_unassigned') {
+      btn = '<button type="button" class="btn-outline" data-act="alertTuePlanner">จัดช่องอังคาร</button>';
+    } else {
+      btn = '<button type="button" class="btn-outline" data-act="alertViewDay" data-date="' + date + '">ดูวันนี้</button>';
+    }
+    return '<div class="alert-item"><span>' + esc(a.message) + '</span>' + btn + '</div>';
+  }
+  function buildAlertSheet(list) {
+    var today = state.today;
+    function dayBlock(m) {
+      return '<div class="alert-day"><div style="font-size:13px;font-weight:600">' + esc(alertDayLabel(m.date)) + '</div>' +
+        m.alerts.map(function (a) { return alertItemHtml(m.date, a); }).join('') + '</div>';
+    }
+    var upcoming = list.filter(function (m) { return m.date >= today; });
+    var past = list.filter(function (m) { return m.date < today; });
+    var body = upcoming.map(dayBlock).join('');
+    if (past.length) {
+      body += '<div style="font-size:12px;font-weight:600;color:#6B6257;margin-top:14px;letter-spacing:.3px">ที่ผ่านมา</div>' + past.map(dayBlock).join('');
+    }
+    return '<div class="modal-backdrop" data-act="closeAlerts">' +
+      '<div class="modal-sheet" data-act="stop" style="position:relative">' +
+      '<button type="button" class="day-modal-close" data-act="closeAlerts" aria-label="ปิด">✕</button>' +
+      '<div style="font-weight:600;font-size:18px;padding-right:36px">⚠️ ต้องจัดการ</div>' +
+      body +
+      '</div></div>';
+  }
+
   // P5 §4.1: bottom-sheet day pop-up — replaces the old inline day-detail card.
   // Reuses .modal-backdrop / .modal-sheet. Closes via ✕, backdrop tap, or Escape (handled in drawCalendar).
-  function buildDayModal(month, sel, ym) {
+  function buildDayModal(month, sel, ym, dayAlertList) {
     var d = Number(sel.slice(8, 10));
     var wd = weekdayOf(sel);
     var day = month.days[d - 1];
@@ -825,6 +941,9 @@
       '<div><div style="font-weight:600;font-size:18px">' + esc(title) + '</div></div>' +
       '<span class="pill p-base">' + working + ' คนเข้างาน</span>' +
       '</div>' +
+      ((dayAlertList && dayAlertList.length)
+        ? '<div class="alert-box">' + dayAlertList.map(function (a) { return '<div>⚠️ ' + esc(a.message) + '</div>'; }).join('') + '</div>'
+        : '') +
       '<div style="margin-top:8px">' + rows + '</div>' +
       tueHtml +
       '<div style="font-size:12px;font-weight:600;color:#6B6257;margin-top:10px;letter-spacing:.3px">เหตุการณ์วันนี้</div>' +
@@ -839,6 +958,7 @@
     state.ym = date.slice(0, 7);
     calState.selectedByYm[state.ym] = date;
     calState.modalOpen = false;
+    calState.alertOpen = false;
     tuePlanState.open = false;
     lockBodyScroll(false);
     if (location.hash === '#calendar') route(); else navigate('#calendar');
@@ -849,8 +969,8 @@
   function resetRecState(prefillDate, editingEvent) {
     recState = {
       type: 'absent', date: prefillDate || state.today, date2: '',
-      absentee: '', portion: 1, subMode: 'none', teamSub: '', payMode: 'normal',
-      tempSub: '', newTempNick: '', newTempRate: 625, newTempRegular: true,
+      absentee: '', portion: 1, subMode: 'pending', teamSub: '', payMode: 'normal', // P9: subMode team | outside | pending (รอหาคนแทน) | none (ไม่ต้องมีคนแทน)
+      tempSub: '', newTempNick: '', newTempRate: 625, newTempRegular: true, newTempBank: '', newTempAcct: '', focusSub: false,
       adhocPerson: '', swapA: '', swapB: '', note: '', eventId: '', saved: false, savedCalNote: '',
       dayRoster: [], dayRoster2: [],
       payPeriodChoice: 'event', dateMonthClosed: false,
@@ -877,6 +997,9 @@
           var subP = personById(e.person2_id);
           if (subP && subP.group === 'temp') { recState.subMode = 'outside'; recState.tempSub = e.person2_id; }
           else { recState.subMode = 'team'; recState.teamSub = e.person2_id; recState.payMode = e.sub_pay === 'adhoc' ? 'adhoc' : 'normal'; }
+        } else {
+          // legacy events (no substitute, blank cover) count as "ไม่ต้องมีคนแทน"
+          recState.subMode = e.cover === 'pending' ? 'pending' : 'none';
         }
       } else if (e.type === 'adhoc') {
         recState.adhocPerson = e.person_id;
@@ -895,6 +1018,11 @@
     } else {
       resetRecState(prefDate, null);
       if (params.type) recState.type = params.type;
+    }
+    // P9 4.2: "หาคนแทน" from the alert sheet opens the event with the substitute section in view.
+    if (params.focus === 'sub' && recState.eventId) {
+      recState.focusSub = true;
+      if (recState.subMode === 'pending' || recState.subMode === 'none') recState.subMode = 'team';
     }
     loadRosterAndDraw();
   }
@@ -989,6 +1117,8 @@
         ev.person2_id = '';
         ev.sub_pay = '';
       }
+      // P9 4.2: cover — '' when a substitute is chosen, else pending (รอหาคนแทน) / none (ไม่ต้องมีคนแทน)
+      ev.cover = recState.subMode === 'pending' ? 'pending' : (recState.subMode === 'none' ? 'none' : '');
     } else if (recState.type === 'adhoc') {
       ev.person_id = recState.adhocPerson;
       ev.portion = recState.portion;
@@ -1093,11 +1223,13 @@
           '</div>' +
           '<div style="font-size:12px;color:#6B6257;margin-top:4px">ใช้เมื่อคนนี้ไม่มีเวรวันนั้น (เช่น จ่ายเป็น AdHoc ไปแล้วแต่ไม่ได้มา) · ไม่มีคนเข้าแทน · ไม่นับเป็นวันตามตาราง</div>';
       } else {
-      absentHtml += '<div class="lbl">คนเข้าแทน</div><div class="seg seg-3">' +
+      absentHtml += '<div class="lbl" id="subSection">คนเข้าแทน</div><div class="seg seg-4">' +
         '<button type="button" class="sg' + (recState.subMode === 'team' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="team">ทีมงาน</button>' +
         '<button type="button" class="sg' + (recState.subMode === 'outside' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="outside">คนนอก</button>' +
-        '<button type="button" class="sg' + (recState.subMode === 'none' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="none">ไม่มี</button>' +
-        '</div>';
+        '<button type="button" class="sg' + (recState.subMode === 'pending' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="pending">รอหาคนแทน</button>' +
+        '<button type="button" class="sg' + (recState.subMode === 'none' ? ' sg-on' : '') + '" data-act="setSubMode" data-m="none">ไม่ต้องมีคนแทน</button>' +
+        '</div>' +
+        (recState.subMode === 'pending' ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">ระบบจะเตือนในปฏิทินจนกว่าจะมีคนแทน</div>' : '');
 
       if (recState.subMode === 'team') {
         var teamOpts = availableSubs(roster);
@@ -1123,6 +1255,10 @@
           '<div style="display:grid;grid-template-columns:minmax(0,1fr) 96px;gap:8px;margin-top:12px">' +
           '<div><label for="tname" style="font-size:11px;font-weight:600;color:#6B6257">ชื่อใหม่</label><input id="tname" data-oninput="setNewTempNick" value="' + esc(recState.newTempNick) + '" placeholder="ชื่อเล่น" style="width:100%;height:42px;margin-top:4px"></div>' +
           '<div><label for="trate" style="font-size:11px;font-weight:600;color:#6B6257">ค่าแรง/วัน</label><input id="trate" data-oninput="setNewTempRate" inputmode="numeric" value="' + esc(recState.newTempRate) + '" style="width:100%;height:42px;margin-top:4px"></div>' +
+          '</div>' +
+          '<div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:8px;margin-top:10px">' +
+          '<div><label for="tbank" style="font-size:11px;font-weight:600;color:#6B6257">ธนาคาร (ไม่บังคับ)</label><input id="tbank" data-oninput="setNewTempBank" value="' + esc(recState.newTempBank) + '" placeholder="เช่น กสิกร" style="width:100%;height:42px;margin-top:4px"></div>' +
+          '<div><label for="tacct" style="font-size:11px;font-weight:600;color:#6B6257">เลขบัญชี (ไม่บังคับ)</label><input id="tacct" data-oninput="setNewTempAcct" inputmode="numeric" autocomplete="off" value="' + esc(recState.newTempAcct) + '" style="width:100%;height:42px;margin-top:4px"></div>' +
           '</div>' +
           '<label class="checkbox-row"><input type="checkbox" data-onchange="setNewTempRegular" ' + (recState.newTempRegular ? 'checked' : '') + '>บันทึกชื่อไว้ให้เลือกครั้งหน้า</label>' +
           '<div style="font-size:12px;color:#6B6257;margin-top:2px">ไม่ติ๊ก = ใช้ครั้งเดียว ชื่อจะไม่ขึ้นในรายการครั้งถัดไป (ข้อมูลเก่ายังอยู่)</div>' +
@@ -1199,7 +1335,7 @@
     actions.setOffSchedule = function (el) {
       recState.offSchedule = !!el.checked;
       recState.absentee = '';        // the candidate list changes (roster vs everyone)
-      recState.subMode = 'none'; recState.teamSub = ''; recState.tempSub = '';
+      recState.subMode = 'pending'; recState.teamSub = ''; recState.tempSub = '';
       if (recState.offSchedule && recState.deductMode !== 'absent') recState.deductMode = 'adhoc';
       refreshRecord();
     };
@@ -1215,13 +1351,15 @@
     actions.setTempSub = function (el) { recState.tempSub = el.getAttribute('data-id'); refreshRecord(); };
     actions.setNewTempNick = function (el) { recState.newTempNick = el.value; };
     actions.setNewTempRate = function (el) { recState.newTempRate = el.value; };
+    actions.setNewTempBank = function (el) { recState.newTempBank = el.value; };
+    actions.setNewTempAcct = function (el) { recState.newTempAcct = el.value; };
     actions.setNewTempRegular = function (el) { recState.newTempRegular = el.checked; };
     actions.addTempPerson = function (el) {
       var nick = (recState.newTempNick || '').trim();
       if (!nick) { toast('กรุณาใส่ชื่อคนนอก'); return; }
-      withSavingButton(el, function () { return write('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular }).then(function (person) {
+      withSavingButton(el, function () { return write('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular, bank: (recState.newTempBank || '').trim(), account_no: (recState.newTempAcct || '').replace(/[^0-9]/g, '') }).then(function (person) {
         recState.tempSub = person.id;
-        recState.newTempNick = ''; recState.newTempRate = 625; recState.newTempRegular = true;
+        recState.newTempNick = ''; recState.newTempRate = 625; recState.newTempRegular = true; recState.newTempBank = ''; recState.newTempAcct = '';
         refreshRecord();
       }); });
     };
@@ -1232,11 +1370,17 @@
     actions.saveRecord = function (el) {
       var ev = buildEventPayload();
       withSavingButton(el, function () { return write('saveEvent', { event: ev }).then(function (res) {
-        toast('บันทึกแล้ว');
+        var stillAlert = (window.dayAlerts(ev.date, state.bundle) || []).length > 0;
+        toast(stillAlert ? 'บันทึกแล้ว · วันนี้ยังมีเรื่องต้องจัดการ' : 'บันทึกแล้ว');
         showCalendarOn(ev.date);
         syncCalendarBg(res.event.event_id); // P8: Calendar is synced in the background, after the save
       }); });
     };
+    if (recState.focusSub) {
+      recState.focusSub = false;
+      var subEl = document.getElementById('subSection');
+      if (subEl && subEl.scrollIntoView) subEl.scrollIntoView({ block: 'start' });
+    }
     actions.deleteRecord = function (el) {
       if (!window.confirm('ลบเหตุการณ์นี้ใช่หรือไม่')) return;
       var delId = recState.eventId, delDate = recState.date;
@@ -1356,16 +1500,33 @@
         '</div>' + linesHtml + '</div>';
     }).join('');
 
+    // P9 4.1: per-person temp card - bank details + copy button, one paid tick per day (owner only).
+    var isOwner = state.role === 'owner';
     var tempsHtml = payout.temps.map(function (t) {
-      var linesTxt = t.lines.map(function (l) { return esc(l); }).join(' · ');
-      return '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:10px 14px;border-bottom:1px solid #F0EAE0">' +
-        '<div><div style="font-size:14px;font-weight:600">' + esc(t.nick) + ' <span style="font-size:11px;font-weight:400;color:#7A7064">คนนอก ★</span></div><div style="font-size:12px;color:#6B6257;margin-top:2px">' + linesTxt + '</div></div>' +
-        '<span style="font-size:14px;font-weight:600">' + money2(t.amount) + '</span></div>';
+      var acct = String(t.account_no || '').replace(/[^0-9]/g, '');
+      var bankHtml = (t.bank || acct)
+        ? '<div style="margin-top:6px;font-size:12px;color:#6B6257">' + (t.bank ? 'ธนาคาร ' + esc(t.bank) : '') + '</div>' +
+          (acct ? '<div style="display:flex;align-items:center;gap:8px;margin-top:4px"><span class="bank-box">' + esc(acct) + '</span>' +
+            '<button type="button" class="btn-outline" style="height:36px;padding:0 12px" data-act="copyAcct" data-acct="' + esc(acct) + '">คัดลอกเลขบัญชี</button></div>' : '')
+        : '<div style="margin-top:6px;font-size:12px;color:#9A4F0E">ยังไม่มีเลขบัญชี — Owner เพิ่มได้ในตั้งค่า</div>';
+      var daysHtml = t.days.map(function (d) {
+        var ctl;
+        if (isOwner) {
+          ctl = '<label class="checkbox-row" style="margin:0"><input type="checkbox" data-onchange="toggleTempDay" data-id="' + esc(d.event_id) + '" ' + (d.paid ? 'checked' : '') + '>จ่ายแล้ว</label>';
+        } else {
+          ctl = d.paid
+            ? '<span class="pill p-sub">จ่ายแล้ว ✓ ' + esc(d.paid_by || '') + ' ' + esc(ddmm(d.paid_at)) + '</span>'
+            : '<span class="pill p-base">ยังไม่จ่าย</span>';
+        }
+        return '<div class="temp-day"><div><div style="font-weight:500">' + esc(ddmm(d.date)) + ' · ' + esc(d.label) + '</div>' +
+          '<div style="color:#6B6257">' + money2(d.amount) + (isOwner && d.paid ? ' · จ่ายโดย ' + esc(d.paid_by || '') + ' ' + esc(ddmm(d.paid_at)) : '') + '</div></div>' + ctl + '</div>';
+      }).join('');
+      return '<div style="padding:10px 14px;border-bottom:1px solid #F0EAE0">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline"><span style="font-size:14px;font-weight:600">' + esc(t.nick) + ' <span style="font-size:11px;font-weight:400;color:#7A7064">คนนอก ★</span></span>' +
+        '<span style="font-size:14px;font-weight:600">' + money2(t.amount) + '</span></div>' +
+        bankHtml + '<div style="margin-top:6px">' + daysHtml + '</div></div>';
     }).join('');
 
-    var paid = payout.tempPaid && payout.tempPaid.paid;
-    var paidLabel = paid ? ('จ่ายแล้ว ✓ ' + esc(payout.tempPaid.marked_by || '')) : 'ทำเครื่องหมายว่าจ่ายแล้ว';
-    var paidDisabled = payout.closed ? 'disabled' : '';
     var statusPill = payout.closed ? '<span class="status-pill status-pill-closed">งวดปิดแล้ว</span>' : '<span class="status-pill">งวดยังเปิด</span>';
 
     app.innerHTML =
@@ -1392,8 +1553,9 @@
       '<div class="card-plain" style="border-color:#17613B;overflow:hidden">' +
       tempsHtml +
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#F2FAF5">' +
-      '<div><div style="font-size:12px;color:#17613B">ต้องจ่ายคนนอกเดือนนี้ (เงินสด/โอน)</div><div style="font-size:20px;font-weight:600;color:#17613B">' + money2(payout.tempTotal) + '</div></div>' +
-      '<button type="button" class="paid' + (paid ? ' paid-on' : '') + '" data-act="togglePaid" ' + paidDisabled + '>' + paidLabel + '</button>' +
+      '<div style="width:100%"><div style="display:flex;justify-content:space-between;font-size:13px;color:#17613B"><span>ต้องจ่ายทั้งหมด</span><span style="font-weight:600">' + money2(payout.tempTotal) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:13px;color:#17613B;margin-top:2px"><span>จ่ายแล้ว</span><span style="font-weight:600">' + money2(payout.tempPaidTotal) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:15px;color:#9B1C12;margin-top:2px"><span>ค้างจ่าย</span><span style="font-weight:600">' + money2(payout.tempUnpaidTotal) + '</span></div></div>' +
       '</div>' +
       '</div>' +
       '<div class="export-card">' +
@@ -1408,9 +1570,16 @@
 
     actions.prevMonth = function () { shiftMonth(-1); };
     actions.nextMonth = function () { shiftMonth(1); };
-    actions.togglePaid = function (el) {
-      if (payout.closed) return;
-      withSavingButton(el, function () { return write('markTempPaid', { ym: ym, paid: !paid }).then(function () { renderPayout(); }); });
+    actions.copyAcct = function (el) {
+      copyText(el.getAttribute('data-acct') || '', function () { toast('คัดลอกแล้ว'); });
+    };
+    // owner-only; allowed even when the pay period is closed (cash paid outside payroll)
+    actions.toggleTempDay = function (el) {
+      var box = el;
+      var want = !!box.checked;
+      write('markTempDayPaid', { event_id: box.getAttribute('data-id'), paid: want }).then(function () {
+        renderPayout();
+      }).catch(function () { box.checked = !want; });
     };
     actions.downloadCsv = function () {
       var blob = new Blob([payout.csv], { type: 'text/csv;charset=utf-8' });
@@ -1692,6 +1861,7 @@
       var f = settingsState.personForm;
       if (!f.nick) { toast('กรุณาใส่ชื่อเล่น'); return; }
       var payload = { nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
+      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
       if (f.id) payload.id = f.id;
       withSavingButton(el, function () { return write('savePerson', payload).then(function () {
         toast('บันทึกแล้ว');
@@ -1827,8 +1997,9 @@
   function openPersonModal(d, id) {
     var existing = id ? d.people.find(function (p) { return p.id === id; }) : null;
     settingsState.personForm = existing ? {
-      id: existing.id, nick: existing.nick, group: existing.group, code: existing.code, active: existing.active, regular: existing.regular
-    } : { id: '', nick: '', group: 'staff', code: '', active: true, regular: false };
+      id: existing.id, nick: existing.nick, group: existing.group, code: existing.code, active: existing.active, regular: existing.regular,
+      bank: existing.bank || '', account_no: existing.account_no || ''
+    } : { id: '', nick: '', group: 'staff', code: '', active: true, regular: false, bank: '', account_no: '' };
     settingsState.personIsNew = !existing;
     settingsState.modal = personModalHtml();
     drawSettingsOwner();
@@ -1845,6 +2016,10 @@
       '<div class="form-row"><label for="pNick">ชื่อเล่น</label><input id="pNick" data-oninput="setPersonField" data-field="nick" value="' + esc(f.nick) + '"></div>' +
       '<div class="form-row"><label for="pGroup">กลุ่ม</label><select id="pGroup" data-onchange="setPersonField" data-field="group">' + groupOpts + '</select></div>' +
       '<div class="form-row"><label for="pCode">โค้ด (ตัวย่อในปฏิทิน)</label><input id="pCode" data-oninput="setPersonField" data-field="code" value="' + esc(f.code) + '"></div>' +
+      (f.group === 'temp'
+        ? '<div class="form-row"><label for="pBank">ธนาคาร</label><input id="pBank" data-oninput="setPersonField" data-field="bank" value="' + esc(f.bank) + '" placeholder="เช่น กสิกร"></div>' +
+          '<div class="form-row"><label for="pAcct">เลขบัญชี</label><input id="pAcct" data-oninput="setPersonField" data-field="account_no" inputmode="numeric" autocomplete="off" value="' + esc(f.account_no) + '"></div>'
+        : '') +
       '<label class="checkbox-row"><input type="checkbox" data-onchange="setPersonCheck" data-field="active" ' + (f.active ? 'checked' : '') + '>ใช้งานอยู่</label>' +
       '<label class="checkbox-row"><input type="checkbox" data-onchange="setPersonCheck" data-field="regular" ' + (f.regular ? 'checked' : '') + '>คนประจำ (ขึ้นในตัวเลือกด่วน)</label>' +
       '<button type="button" class="btn-primary" style="margin-top:14px" data-act="savePersonForm">บันทึก</button>' +
