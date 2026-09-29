@@ -81,21 +81,88 @@
     document.body.appendChild(toastEl);
     setTimeout(function () { if (toastEl) { toastEl.remove(); toastEl = null; } }, 3200);
   }
-  var loadingCount = 0;
+  // ---------- P5 §4.3: loading bar with % label + tap-lock overlay ----------
+  // Several concurrent requests share one bar/overlay via a counter. Background prefetch (api(action, payload, {silent:true}))
+  // never shows the bar or the overlay.
+  var loadingCount = 0; // visible (non-silent) requests in flight
+  var loadingPct = 0;
+  var loadingTimer = null;
+  var loadingFadeTimer = null;
+
+  function ensureLoadingEls() {
+    var wrap = document.getElementById('loadingBarWrap');
+    if (wrap) return wrap;
+    wrap = document.createElement('div');
+    wrap.id = 'loadingBarWrap';
+    wrap.className = 'loading-bar-wrap';
+    wrap.innerHTML = '<div class="loading-bar-track"><div class="loading-bar-fill" id="loadingBarFill"></div></div>' +
+      '<div class="loading-bar-label" id="loadingBarLabel">กำลังโหลด… 0%</div>';
+    document.body.appendChild(wrap);
+    var overlay = document.createElement('div');
+    overlay.id = 'tapLockOverlay';
+    overlay.className = 'tap-lock-overlay';
+    document.body.appendChild(overlay);
+    return wrap;
+  }
+
+  function setLoadingPct(pct) {
+    loadingPct = pct;
+    var fill = document.getElementById('loadingBarFill');
+    var label = document.getElementById('loadingBarLabel');
+    if (fill) fill.style.width = pct + '%';
+    if (label) label.textContent = 'กำลังโหลด… ' + Math.round(pct) + '%';
+  }
+
+  function startLoadingAnim() {
+    if (loadingTimer) return;
+    ensureLoadingEls();
+    var wrap = document.getElementById('loadingBarWrap');
+    if (wrap) wrap.style.opacity = '1';
+    setLoadingPct(0);
+    loadingTimer = setInterval(function () {
+      var gap = 90 - loadingPct;
+      setLoadingPct(loadingPct + gap * 0.1);
+    }, 100);
+  }
+
+  function stopLoadingAnim() {
+    if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
+    setLoadingPct(100);
+    if (loadingFadeTimer) clearTimeout(loadingFadeTimer);
+    loadingFadeTimer = setTimeout(function () {
+      var wrap = document.getElementById('loadingBarWrap');
+      if (wrap) wrap.style.opacity = '0';
+      var overlay = document.getElementById('tapLockOverlay');
+      if (overlay) overlay.remove();
+      var w2 = document.getElementById('loadingBarWrap');
+      if (w2) w2.remove();
+      setLoadingPct(0);
+    }, 300);
+  }
+
   function setLoading(on) {
     loadingCount += on ? 1 : -1;
     if (loadingCount < 0) loadingCount = 0;
-    var bar = document.getElementById('loadingBar');
     if (loadingCount > 0) {
-      if (!bar) {
-        bar = document.createElement('div');
-        bar.id = 'loadingBar';
-        bar.className = 'loading-bar';
-        document.body.appendChild(bar);
-      }
-    } else if (bar) {
-      bar.remove();
+      if (loadingFadeTimer) { clearTimeout(loadingFadeTimer); loadingFadeTimer = null; }
+      startLoadingAnim();
+    } else {
+      stopLoadingAnim();
     }
+  }
+
+  // P5 §4.3: buttons that trigger writes get disabled + "กำลังบันทึก…" while the request is in flight.
+  // On success the caller normally re-renders the screen (which naturally clears the disabled state);
+  // on failure we restore the button so the user can retry.
+  function withSavingButton(el, fn) {
+    if (!el) return fn();
+    var orig = el.textContent;
+    el.disabled = true;
+    el.textContent = 'กำลังบันทึก…';
+    var restore = function () { el.disabled = false; el.textContent = orig; };
+    var p = fn();
+    if (p && typeof p.catch === 'function') p.catch(restore);
+    return p;
   }
 
   function clearSession() {
@@ -104,8 +171,10 @@
   }
 
   // ---------- API helper ----------
-  function api(action, payload) {
-    setLoading(true);
+  // opts.silent = true -> background prefetch: no loading bar, no tap-lock overlay (P5 §4.2/§4.3).
+  function api(action, payload, opts) {
+    var silent = !!(opts && opts.silent);
+    if (!silent) setLoading(true);
     var p;
     if (window.SHIFTLOG_MOCK) {
       p = window.SHIFTLOG_MOCK(action, state.token, payload || {});
@@ -117,7 +186,7 @@
       }).then(function (r) { return r.json(); });
     }
     return p.then(function (res) {
-      setLoading(false);
+      if (!silent) setLoading(false);
       if (!res || !res.ok) {
         var msg = (res && res.error) || 'เกิดข้อผิดพลาด';
         var code = res && res.code;
@@ -125,7 +194,7 @@
           clearSession();
           toast(msg);
           navigate('#login');
-        } else {
+        } else if (!silent) {
           toast(msg);
         }
         var err = new Error(msg);
@@ -134,17 +203,32 @@
       }
       return res.data;
     }, function (networkErr) {
-      setLoading(false);
-      toast('เชื่อมต่อไม่ได้');
+      if (!silent) { setLoading(false); toast('เชื่อมต่อไม่ได้'); }
       throw networkErr;
     });
   }
 
-  function getMonth(ym) {
+  function getMonth(ym, opts) {
     if (state.monthCache[ym]) return Promise.resolve(state.monthCache[ym]);
-    return api('month', { ym: ym }).then(function (data) { state.monthCache[ym] = data; return data; });
+    return api('month', { ym: ym }, opts).then(function (data) { state.monthCache[ym] = data; return data; });
   }
   function invalidateMonth(ym) { delete state.monthCache[ym]; }
+  function invalidateAllMonths() { state.monthCache = {}; }
+
+  // P5 §4.2: after rendering a month, silently prefetch the adjacent months in the background.
+  function prefetchAdjacentMonths(ym) {
+    function shiftYm(base, delta) {
+      var y = Number(base.slice(0, 4)), m = Number(base.slice(5, 7)) + delta;
+      if (m < 1) { m = 12; y--; }
+      if (m > 12) { m = 1; y++; }
+      return y + '-' + pad2(m);
+    }
+    [shiftYm(ym, -1), shiftYm(ym, 1)].forEach(function (adjYm) {
+      if (!state.monthCache[adjYm]) {
+        getMonth(adjYm, { silent: true }).catch(function () { /* ignore prefetch failure */ });
+      }
+    });
+  }
 
   // ---------- router ----------
   var actions = {};
@@ -301,17 +385,35 @@
   }
 
   // ================= CALENDAR =================
-  var calState = { selectedByYm: {} };
+  var calState = { selectedByYm: {}, modalOpen: false, tueModalChoice: '', tueModalCurrent: '' };
+  var CHANGED_STATUSES = ['abs', 'hab', 'emg', 'sub', 'tmp', 'adh', 'swo', 'swi'];
   var STATUS_LABEL = { base: 'ตามเวร', abs: 'ขาด', hab: 'ขาดครึ่งวัน', sub: 'เข้าแทน', adh: 'AdHoc', swo: 'สลับออก', swi: 'สลับเข้า', emg: 'ลาฉุกเฉิน', tmp: 'คนนอกเข้าแทน' };
   var STATUS_PILLCLS = { base: 'pill p-base', abs: 'pill p-abs', hab: 'pill p-abs', sub: 'pill p-sub', adh: 'pill p-adh', swo: 'pill p-swp', swi: 'pill p-swp', emg: 'pill p-emg', tmp: 'pill p-tmp' };
   var TYPE_TAG = { absent: 'ขาด', emergency: 'ลาฉุกเฉิน', adhoc: 'AdHoc', swap: 'สลับวัน' };
   var TYPE_PILLCLS = { absent: 'pill p-abs', emergency: 'pill p-emg', adhoc: 'pill p-adh', swap: 'pill p-swp' };
 
+  // P5 §4.1: calendar display mode, remembered in localStorage sl_calmode. 'changed' (default) or 'all'.
+  function getCalMode() { return lsGet('sl_calmode') === 'all' ? 'all' : 'changed'; }
+  function setCalMode(m) { lsSet('sl_calmode', m); }
+
+  function nickChip(r) {
+    if (!r.id) return '?';
+    var p = personById(r.id);
+    return p ? p.nick : r.id;
+  }
+
   function renderCalendar(params) {
+    // Only auto-open the day pop-up when navigated here with an explicit ?date= (e.g. right after
+    // saving/deleting a record). Landing on the Calendar tab normally should not pop the sheet open.
+    calState.modalOpen = !!(params && params.date);
     if (params && params.date) {
       var pym = params.date.slice(0, 7);
       state.ym = pym;
       calState.selectedByYm[pym] = params.date;
+      if (calState.modalOpen) { calState.modalOpenedFor = null; lockBodyScroll(true); }
+      else lockBodyScroll(false);
+    } else {
+      lockBodyScroll(false);
     }
     var ym = state.ym;
     app.innerHTML = shellSkeleton(ymLabel(ym), 'calendar');
@@ -322,10 +424,13 @@
         calState.selectedByYm[ym] = sel;
       }
       drawCalendar(month, sel, ym);
+      prefetchAdjacentMonths(ym);
+      lsSetJSON('sl_last_month', { ym: ym, month: month });
     });
   }
 
   function drawCalendar(month, sel, ym) {
+    var mode = getCalMode();
     var firstWd = weekdayOf(ym + '-01');
     var leading = (firstWd + 6) % 7;
     var n = daysInMonth(ym);
@@ -335,10 +440,15 @@
       var date = ym + '-' + pad2(d);
       var day = month.days[d - 1];
       var hasEv = day.events.length > 0;
-      var chips = day.roster.map(function (r) {
-        var code = codeOf(r);
+      var rosterForCell = day.roster;
+      if (mode === 'changed') {
+        rosterForCell = day.roster.filter(function (r) {
+          return CHANGED_STATUSES.indexOf(r.status) !== -1 || (r.slot === 'tue' && r.unassigned);
+        });
+      }
+      var chips = rosterForCell.map(function (r) {
         var cls = 'chip st-' + r.status + (r.slot === 'tue' ? ' slot' : '');
-        return '<span class="' + cls + '">' + esc(code) + '</span>';
+        return '<span class="' + cls + '">' + esc(nickChip(r)) + '</span>';
       }).join('');
       var cls = 'cell' + (date === sel ? ' cell-sel' : '');
       cellsHtml += '<button type="button" class="' + cls + '" data-act="pickDay" data-date="' + date + '" aria-label="' + d + ' ' + esc(THAI_MONTH_FULL[Number(ym.slice(5, 7)) - 1]) + '">' +
@@ -346,43 +456,53 @@
         '<span style="font-size:12px;font-weight:600">' + d + '</span>' +
         (hasEv ? '<span style="width:7px;height:7px;border-radius:50%;background:#B8641A"></span>' : '') +
         '</div>' +
-        '<div style="display:flex;flex-wrap:wrap;gap:2px">' + chips + '</div>' +
+        '<div class="cell-chips">' + chips + '</div>' +
         '</button>';
     }
     var legend =
       '<div class="legend">' +
-      '<span class="item"><span class="chip st-base">MO</span>ตามเวร</span>' +
-      '<span class="item"><span class="chip st-abs">MO</span>ขาด</span>' +
-      '<span class="item"><span class="chip st-sub">DA</span>เข้าแทน</span>' +
-      '<span class="item"><span class="chip st-adh">TO</span>AdHoc</span>' +
-      '<span class="item"><span class="chip st-swi">BO</span>สลับ</span>' +
-      '<span class="item"><span class="chip st-emg">DK</span>ลาฉุกเฉิน</span>' +
-      '<span class="item"><span class="chip st-tmp">นอก</span>คนนอกเข้าแทน</span>' +
-      '<span class="item"><span class="chip st-base slot">AI</span>ช่องอังคาร</span>' +
+      '<span class="item"><span class="chip st-base">MOST</span>ตามเวร</span>' +
+      '<span class="item"><span class="chip st-abs">MOST</span>ขาด</span>' +
+      '<span class="item"><span class="chip st-sub">Dao</span>เข้าแทน</span>' +
+      '<span class="item"><span class="chip st-adh">Tong</span>AdHoc</span>' +
+      '<span class="item"><span class="chip st-swi">Bomb</span>สลับ</span>' +
+      '<span class="item"><span class="chip st-emg">Dook</span>ลาฉุกเฉิน</span>' +
+      '<span class="item"><span class="chip st-tmp">คนนอก</span>คนนอกเข้าแทน</span>' +
+      '<span class="item"><span class="chip st-base slot">Ai</span>ช่องอังคาร</span>' +
       '</div>';
 
-    var detail = buildDayDetail(month, sel);
+    var calmodeHtml = '<div class="calmode-row">' +
+      '<button type="button" class="calmode-btn' + (mode === 'changed' ? ' calmode-on' : '') + '" data-act="setCalMode" data-mode="changed">เฉพาะที่เปลี่ยน</button>' +
+      '<button type="button" class="calmode-btn' + (mode === 'all' ? ' calmode-on' : '') + '" data-act="setCalMode" data-mode="all">ทั้งหมด</button>' +
+      '</div>';
 
     app.innerHTML =
       '<div class="shell">' +
       monthHeaderHtml('', ym) +
       '<main class="app-main">' +
+      calmodeHtml +
       '<div class="cal-grid" style="padding-bottom:4px">' +
       '<div class="cal-dow">จ</div><div class="cal-dow">อ</div><div class="cal-dow">พ</div><div class="cal-dow">พฤ</div><div class="cal-dow">ศ</div><div class="cal-dow">ส</div><div class="cal-dow">อา</div>' +
       '</div>' +
       '<div class="cal-grid">' + cellsHtml + '</div>' +
       legend +
-      detail +
       '</main>' +
       navHtml('calendar') +
+      (calState.modalOpen ? buildDayModal(month, sel, ym) : '') +
       '</div>';
 
+    actions.stop = function () { /* no-op: absorbs clicks inside modal sheet */ };
+    actions.setCalMode = function (el) { setCalMode(el.getAttribute('data-mode')); drawCalendar(month, sel, ym); };
     actions.pickDay = function (el) {
       calState.selectedByYm[ym] = el.getAttribute('data-date');
+      calState.modalOpen = true;
+      calState.modalOpenedFor = null; // force the Tuesday selector to re-init from server state
+      lockBodyScroll(true);
       drawCalendar(month, calState.selectedByYm[ym], ym);
     };
     actions.prevMonth = function () { shiftMonth(-1); };
     actions.nextMonth = function () { shiftMonth(1); };
+    actions.closeDayModal = function () { calState.modalOpen = false; lockBodyScroll(false); drawCalendar(month, sel, ym); };
     actions.addEvent = function () { navigate('#record?date=' + sel); };
     actions.editEvent = function (el) { navigate('#record?date=' + sel + '&event_id=' + encodeURIComponent(el.getAttribute('data-id'))); };
     actions.deleteEvent = function (el) {
@@ -394,15 +514,41 @@
         renderCalendar({});
       });
     };
+    actions.setTueModalChoice = function (el) { calState.tueModalChoice = el.value; };
+    actions.saveTueModalSlot = function (el) {
+      withSavingButton(el, function () { return api('setTueSlot', { date: sel, person_id: calState.tueModalChoice || '' }).then(function () {
+        invalidateMonth(ym);
+        toast('บันทึกช่องอังคารแล้ว');
+        renderCalendar({});
+      }); });
+    };
+    if (calState.modalOpen) bindDayModalEsc();
   }
 
-  function buildDayDetail(month, sel) {
+  function lockBodyScroll(on) {
+    document.body.style.overflow = on ? 'hidden' : '';
+  }
+
+  var dayModalEscBound = false;
+  function bindDayModalEsc() {
+    if (dayModalEscBound) return;
+    dayModalEscBound = true;
+    document.addEventListener('keydown', function onEsc(e) {
+      if (e.key === 'Escape' && calState.modalOpen) {
+        var el = document.querySelector('[data-act="closeDayModal"]');
+        if (el) el.click();
+      }
+    });
+  }
+
+  // P5 §4.1: bottom-sheet day pop-up — replaces the old inline day-detail card.
+  // Reuses .modal-backdrop / .modal-sheet. Closes via ✕, backdrop tap, or Escape (handled in drawCalendar).
+  function buildDayModal(month, sel, ym) {
     var d = Number(sel.slice(8, 10));
     var wd = weekdayOf(sel);
     var day = month.days[d - 1];
     var title = THAI_WEEKDAY_FULL[wd] + ' ' + d + ' ' + THAI_MONTH_SHORT[Number(sel.slice(5, 7)) - 1] + ' ' + sel.slice(0, 4);
     var working = day.roster.filter(function (r) { return r.id && ['abs', 'emg', 'swo'].indexOf(r.status) === -1; }).length;
-    var sub = day.events.length ? ('เปลี่ยนแปลง ' + day.events.length + ' รายการ') : 'ไม่มีการเปลี่ยนแปลง';
 
     var rows = day.roster.map(function (r) {
       var p = r.id ? personById(r.id) : null;
@@ -450,16 +596,37 @@
       ? '<span class="pill" style="margin-top:12px;display:inline-flex;background:#FBE8C4;color:#744400">งวดปิดแล้ว</span>'
       : '<button type="button" class="btn-secondary" style="margin-top:12px" data-act="addEvent">+ เพิ่มเหตุการณ์วันนี้</button>';
 
-    return '<section class="card" style="margin-top:14px">' +
-      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">' +
-      '<div><div style="font-weight:600;font-size:18px">' + esc(title) + '</div><div style="font-size:12px;color:#6B6257;margin-top:1px">' + esc(sub) + '</div></div>' +
+    // P5 §4.5: on Tuesdays the popup also shows the Tuesday-slot selector inline (staff and owner alike).
+    var tueHtml = '';
+    if (wd === 2) {
+      var slotEntry = day.roster.find(function (r) { return r.slot === 'tue'; });
+      var curId = slotEntry && !slotEntry.unassigned ? slotEntry.id : '';
+      calState.tueModalCurrent = curId;
+      if (calState.modalOpenedFor !== sel) { calState.tueModalChoice = curId; calState.modalOpenedFor = sel; }
+      var tueOpts = state.tueAllowed.map(function (id) { return personById(id); }).filter(Boolean);
+      var tueOptsHtml = '<option value=""' + (calState.tueModalChoice === '' ? ' selected' : '') + '>ยังไม่จัด</option>' +
+        tueOpts.map(function (p) { return '<option value="' + p.id + '"' + (calState.tueModalChoice === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
+      tueHtml = '<div class="tue-ctl">' +
+        '<div style="font-size:13px;font-weight:600">ช่องอังคาร</div>' +
+        '<select data-onchange="setTueModalChoice" style="width:100%;height:42px;margin-top:6px">' + tueOptsHtml + '</select>' +
+        '<div style="font-size:11px;color:#6B6257;margin-top:6px">บันทึกว่าอังคารนี้ใครเข้าร้านตามรอบ (ไม่ใช่การขาดหรือ AdHoc · ไม่มีผลต่อเงิน)</div>' +
+        '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="saveTueModalSlot">บันทึกช่องอังคาร</button>' +
+        '</div>';
+    }
+
+    return '<div class="modal-backdrop" data-act="closeDayModal">' +
+      '<div class="modal-sheet" data-act="stop" style="position:relative">' +
+      '<button type="button" class="day-modal-close" data-act="closeDayModal" aria-label="ปิด">✕</button>' +
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding-right:36px">' +
+      '<div><div style="font-weight:600;font-size:18px">' + esc(title) + '</div></div>' +
       '<span class="pill p-base">' + working + ' คนเข้างาน</span>' +
       '</div>' +
       '<div style="margin-top:8px">' + rows + '</div>' +
+      tueHtml +
       '<div style="font-size:12px;font-weight:600;color:#6B6257;margin-top:10px;letter-spacing:.3px">เหตุการณ์วันนี้</div>' +
       eventsHtml +
       addBtn +
-      '</section>';
+      '</div></div>';
   }
 
   // ================= RECORD =================
@@ -470,7 +637,7 @@
       absentee: '', portion: 1, subMode: 'none', teamSub: '', payMode: 'normal',
       tempSub: '', newTempNick: '', newTempRate: 625, newTempRegular: true,
       adhocPerson: '', swapA: '', swapB: '', note: '', eventId: '', saved: false, savedCalNote: '',
-      dayRoster: [], dayRoster2: [],
+      dayRoster: [], dayRoster2: [], tueChoice: '', tueCurrent: '',
       preview: { title: '', money: [], errors: [], warnings: [] }, previewTimer: null
     };
     if (editingEvent) {
@@ -528,6 +695,7 @@
       }
     } else {
       resetRecState(prefDate, null);
+      if (params.type) recState.type = params.type;
       loadRosterAndDraw();
     }
   }
@@ -543,6 +711,13 @@
           recState.dayRoster2 = day2 ? day2.roster : [];
           drawRecord();
           schedulePreview();
+        });
+      } else if (recState.type === 'tue' && weekdayOf(recState.date) === 2) {
+        api('tueSlots', { ym: ym }).then(function (rows) {
+          var row = rows.find(function (r) { return r.date === recState.date; });
+          recState.tueCurrent = row ? row.person_id : '';
+          recState.tueChoice = recState.tueCurrent;
+          drawRecord();
         });
       } else {
         drawRecord();
@@ -652,10 +827,15 @@
     var roster = recState.dayRoster || [];
     var rosterNames = roster.filter(function (r) { return r.id; }).map(function (r) { return nickOf(r.id); });
 
-    var typeHtml = '<div class="lbl" style="margin-top:6px">ประเภท</div><div class="seg seg-4">' +
-      [{ k: 'absent', l: 'ขาดงาน' }, { k: 'emergency', l: 'ลาฉุกเฉิน' }, { k: 'swap', l: 'สลับวัน' }, { k: 'adhoc', l: 'AdHoc' }].map(function (t) {
-        return '<button type="button" class="sg' + (t.k === recState.type ? ' sg-on' : '') + '" data-act="setType" data-type="' + t.k + '">' + t.l + '</button>';
-      }).join('') + '</div>';
+    // P5 §4.4: fixed tab order ขาดงาน, AdHoc, สลับวัน, ลาฉุกเฉิน, ช่องอังคาร (new, §4.5).
+    var isTue = weekdayOf(recState.date) === 2;
+    var typeHtml = '<div class="lbl" style="margin-top:6px">ประเภท</div><div class="seg seg-5">' +
+      [{ k: 'absent', l: 'ขาดงาน' }, { k: 'adhoc', l: 'AdHoc' }, { k: 'swap', l: 'สลับวัน' }, { k: 'emergency', l: 'ลาฉุกเฉิน' }, { k: 'tue', l: 'ช่องอังคาร' }].map(function (t) {
+        var disabled = t.k === 'tue' && !isTue;
+        return '<button type="button" class="sg' + (t.k === recState.type ? ' sg-on' : '') + '" data-act="setType" data-type="' + t.k + '"' + (disabled ? ' disabled' : '') + '>' + t.l + '</button>';
+      }).join('') + '</div>' +
+      (recState.type === 'emergency' ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">ลาแบบบริษัทยังจ่ายเงิน (ไม่หักเงิน)</div>' : '') +
+      (recState.type === 'tue' && !isTue ? '<div style="font-size:12px;color:#6B6257;margin-top:4px">เลือกได้เฉพาะวันอังคาร</div>' : '');
 
     var absentHtml = '';
     if (recState.type === 'absent' || recState.type === 'emergency') {
@@ -733,6 +913,25 @@
         '</div>';
     }
 
+    // P5 §4.5: Tuesday-slot tab (moved from Settings). Editable by staff and owner alike (owner decision override).
+    var tueHtml = '';
+    if (recState.type === 'tue') {
+      if (!isTue) {
+        tueHtml = '<div class="tue-ctl tue-ctl-disabled"><div style="font-size:13px;color:#6B6257">เลือกได้เฉพาะวันอังคาร</div></div>';
+      } else {
+        var tueOpts = state.tueAllowed.map(function (id) { return personById(id); }).filter(Boolean);
+        var tueOptsHtml = '<option value=""' + (recState.tueChoice === '' ? ' selected' : '') + '>ยังไม่จัด</option>' +
+          tueOpts.map(function (p) { return '<option value="' + p.id + '"' + (recState.tueChoice === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
+        tueHtml = '<div class="tue-ctl">' +
+          '<div style="font-size:13px;font-weight:600">อังคาร ' + esc(recState.date) + '</div>' +
+          '<div style="font-size:12px;color:#6B6257;margin-top:2px">ปัจจุบัน: ' + esc(recState.tueCurrent ? nickOf(recState.tueCurrent) : 'ยังไม่จัด') + '</div>' +
+          '<div class="form-row"><label for="tueSel">ใครเข้าร้านตามรอบ</label><select id="tueSel" data-onchange="setTueChoice">' + tueOptsHtml + '</select></div>' +
+          '<div style="font-size:11px;color:#6B6257;margin-top:6px">บันทึกว่าอังคารนี้ใครเข้าร้านตามรอบ (ไม่ใช่การขาดหรือ AdHoc · ไม่มีผลต่อเงิน)</div>' +
+          '<button type="button" class="btn-primary" style="margin-top:12px" data-act="saveTueSlot">บันทึกช่องอังคาร</button>' +
+          '</div>';
+      }
+    }
+
     var noteHtml = '<label class="lbl" for="recNote">หมายเหตุ (ไม่บังคับ)</label><textarea id="recNote" rows="2" data-oninput="setNote" placeholder="แจ้งตอน 10 โมง ไม่สบาย" style="width:100%">' + esc(recState.note) + '</textarea>';
 
     app.innerHTML =
@@ -743,13 +942,26 @@
       '<label class="lbl" for="recDate" style="margin-top:0">วันที่</label>' +
       '<input type="date" id="recDate" data-oninput="setDate" value="' + esc(recState.date) + '" style="width:100%;height:48px">' +
       '<div style="font-size:12px;color:#6B6257;margin-top:6px">เวรวันนี้: ' + esc(rosterNames.join(' · ') || '—') + '</div>' +
-      typeHtml + absentHtml + swapHtml + adhocHtml + noteHtml +
-      previewSaveHtml() +
+      typeHtml + absentHtml + swapHtml + adhocHtml + tueHtml +
+      (recState.type === 'tue' ? '' : noteHtml + previewSaveHtml()) +
       '</main>' +
       navHtml('record') +
       '</div>';
 
-    actions.setType = function (el) { recState.type = el.getAttribute('data-type'); loadRosterAndDraw(); };
+    actions.setType = function (el) {
+      var t = el.getAttribute('data-type');
+      if (t === 'tue' && weekdayOf(recState.date) !== 2) return; // ช่องอังคาร: Tuesday only
+      recState.type = t;
+      loadRosterAndDraw();
+    };
+    actions.setTueChoice = function (el) { recState.tueChoice = el.value; };
+    actions.saveTueSlot = function (el) {
+      withSavingButton(el, function () { return api('setTueSlot', { date: recState.date, person_id: recState.tueChoice || '' }).then(function () {
+        invalidateMonth(recState.date.slice(0, 7));
+        toast('บันทึกช่องอังคารแล้ว');
+        navigate('#calendar?date=' + recState.date);
+      }); });
+    };
     actions.setDate = function (el) { recState.date = el.value; loadRosterAndDraw(); };
     actions.setDate2 = function (el) { recState.date2 = el.value; loadRosterAndDraw(); };
     actions.setAbsentee = function (el) { recState.absentee = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
@@ -761,38 +973,38 @@
     actions.setNewTempNick = function (el) { recState.newTempNick = el.value; };
     actions.setNewTempRate = function (el) { recState.newTempRate = el.value; };
     actions.setNewTempRegular = function (el) { recState.newTempRegular = el.checked; };
-    actions.addTempPerson = function () {
+    actions.addTempPerson = function (el) {
       var nick = (recState.newTempNick || '').trim();
       if (!nick) { toast('กรุณาใส่ชื่อคนนอก'); return; }
-      api('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular }).then(function (person) {
+      withSavingButton(el, function () { return api('addTemp', { nick: nick, rate: Number(recState.newTempRate) || 625, regular: !!recState.newTempRegular }).then(function (person) {
         return api('bootstrap', {}).then(function (data) { state.people = data.people; return person; });
       }).then(function (person) {
         recState.tempSub = person.id;
         recState.newTempNick = ''; recState.newTempRate = 625; recState.newTempRegular = true;
         drawRecord(); schedulePreview();
-      });
+      }); });
     };
     actions.setSwapA = function (el) { recState.swapA = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
     actions.setSwapB = function (el) { recState.swapB = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
     actions.setAdhocPerson = function (el) { recState.adhocPerson = el.getAttribute('data-id'); drawRecord(); schedulePreview(); };
     actions.setNote = function (el) { recState.note = el.value; schedulePreview(); };
-    actions.saveRecord = function () {
+    actions.saveRecord = function (el) {
       var ev = buildEventPayload();
-      api('saveEvent', { event: ev }).then(function (res) {
+      withSavingButton(el, function () { return api('saveEvent', { event: ev }).then(function (res) {
         invalidateMonth(ev.date.slice(0, 7));
         if (ev.date2) invalidateMonth(ev.date2.slice(0, 7));
         calState.selectedByYm[ev.date.slice(0, 7)] = ev.date;
         toast('บันทึกแล้ว' + (res.cal_status === 'ok' ? '' : ' · Calendar ยังไม่ซิงก์'));
         navigate('#calendar?date=' + ev.date);
-      });
+      }); });
     };
-    actions.deleteRecord = function () {
+    actions.deleteRecord = function (el) {
       if (!window.confirm('ลบเหตุการณ์นี้ใช่หรือไม่')) return;
-      api('deleteEvent', { event_id: recState.eventId }).then(function () {
+      withSavingButton(el, function () { return api('deleteEvent', { event_id: recState.eventId }).then(function () {
         invalidateMonth(recState.date.slice(0, 7));
         toast('ลบแล้ว');
         navigate('#calendar');
-      });
+      }); });
     };
   }
 
@@ -957,9 +1169,9 @@
 
     actions.prevMonth = function () { shiftMonth(-1); };
     actions.nextMonth = function () { shiftMonth(1); };
-    actions.togglePaid = function () {
+    actions.togglePaid = function (el) {
       if (payout.closed) return;
-      api('markTempPaid', { ym: ym, paid: !paid }).then(function () { renderPayout(); });
+      withSavingButton(el, function () { return api('markTempPaid', { ym: ym, paid: !paid }).then(function () { renderPayout(); }); });
     };
     actions.downloadCsv = function () {
       var blob = new Blob([payout.csv], { type: 'text/csv;charset=utf-8' });
@@ -973,18 +1185,18 @@
 
   // ================= SETTINGS =================
   var settingsState = {
-    data: null, tueSlots: [], modal: '',
-    addRate: { kind: 'normal', person_id: '', amount: '', effective_from: '' },
+    data: null, modal: '',
+    addRate: { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' },
     personForm: null, personIsNew: false,
-    tplDraft: null, pwWhich: 'staff', pw1: '', pw2: ''
+    tplDraft: null, tplViewEff: '', pwWhich: 'staff', pw1: '', pw2: ''
   };
 
   function renderSettings() {
     app.innerHTML = shellSkeleton('ตั้งค่า', 'settings');
     if (state.role !== 'owner') { drawSettingsStaff(); return; }
-    Promise.all([api('settings', {}), api('tueSlots', { ym: state.ym })]).then(function (results) {
-      settingsState.data = results[0];
-      settingsState.tueSlots = results[1];
+    // P5 §4.5: the Tuesday-slot section no longer lives here (moved to Calendar/Record).
+    api('settings', {}).then(function (data) {
+      settingsState.data = data;
       settingsState.modal = '';
       drawSettingsOwner();
     });
@@ -1036,6 +1248,21 @@
     return candidates.reduce(function (a, b) { return b.effective_from > a.effective_from ? b : a; });
   }
 
+  // P5 §4.6: all currently-active `normal` rate variants for one person (generic + weekday + replaces rows),
+  // each kept at its latest effective_from. Used to render the settings rate table conditions.
+  function activeNormalVariants(rates, personId) {
+    var today = state.today;
+    var groups = {};
+    (rates || []).forEach(function (r) {
+      if (r.kind !== 'normal' || r.person_id !== personId || r.effective_from > today) return;
+      var key = (r.weekdays || '') + '|' + (r.replaces || '');
+      if (!groups[key] || r.effective_from > groups[key].effective_from) groups[key] = r;
+    });
+    return Object.keys(groups).map(function (k) { return groups[k]; }).sort(function (a, b) {
+      return (a.weekdays || a.replaces ? 1 : 0) - (b.weekdays || b.replaces ? 1 : 0);
+    });
+  }
+
   function templateEffectiveRows(templates) {
     var today = state.today;
     var candidates = templates.filter(function (t) { return t.effective_from <= today; });
@@ -1057,6 +1284,7 @@
     });
   }
 
+  var WD_CHIP_LABEL = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
   function rateFormHtml(d) {
     var f = settingsState.addRate;
     var kindLabel = { absent_director: 'หักขาด กรรมการ', absent_staff: 'หักขาด พนักงาน', adhoc: 'AdHoc', temp_default: 'ค่าแรงคนนอกเริ่มต้น', normal: 'เรทปกติ (รายคน)', temp: 'ค่าแรงคนนอก (รายคน)' };
@@ -1069,11 +1297,35 @@
       var opts = '<option value="">— เลือกคน —</option>' + list.map(function (p) { return '<option value="' + p.id + '"' + (f.person_id === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
       personRow = '<div class="form-row"><label for="ratePerson">คน</label><select id="ratePerson" data-onchange="setRatePerson">' + opts + '</select></div>';
     }
+    var conditionRow = '';
+    if (f.kind === 'normal') {
+      // P5 §4.6: optional per-weekday / per-replaced-person conditions for `normal` rate rows.
+      var wdChips = [1, 2, 3, 4, 5, 6, 0].map(function (wd) {
+        var on = (f.weekdays || []).indexOf(wd) !== -1;
+        return '<button type="button" class="opt' + (on ? ' opt-on' : '') + '" data-act="toggleRateWeekday" data-wd="' + wd + '">' + WD_CHIP_LABEL[wd] + '</button>';
+      }).join('');
+      var replOpts = '<option value="">— ทุกคน —</option>' + d.people.filter(function (p) { return p.group === 'director' || p.group === 'staff'; }).map(function (p) {
+        return '<option value="' + p.id + '"' + (f.replaces === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>';
+      }).join('');
+      conditionRow = '<div class="form-row"><label>วัน (ไม่บังคับ ว่าง = ทุกวัน)</label><div class="opt-row">' + wdChips + '</div></div>' +
+        '<div class="form-row"><label for="rateReplaces">เมื่อแทน (ไม่บังคับ)</label><select id="rateReplaces" data-onchange="setRateReplaces">' + replOpts + '</select></div>';
+    }
     return '<div class="form-row"><label for="rateKind">ประเภทเรท</label><select id="rateKind" data-onchange="setRateKind">' + kindOpts + '</select></div>' +
-      personRow +
+      personRow + conditionRow +
       '<div class="form-row"><label for="rateAmt">จำนวนเงิน</label><input id="rateAmt" type="number" data-oninput="setRateAmt" value="' + esc(f.amount) + '"></div>' +
       '<div class="form-row"><label for="rateEff">มีผลตั้งแต่วันที่</label><input id="rateEff" type="date" data-oninput="setRateEff" value="' + esc(f.effective_from) + '"></div>' +
       '<button type="button" class="btn-primary" style="margin-top:12px" data-act="submitRate">เพิ่มเรทใหม่</button>';
+  }
+
+  // Human label for a rate row's condition, e.g. "700 · อ,พ" or "700 · แทน MOST" (P5 §4.6).
+  function rateConditionLabel(r) {
+    var parts = [];
+    if (r.weekdays) {
+      var wds = String(r.weekdays).split(',').map(function (s) { return Number(s.trim()); });
+      parts.push(wds.map(function (w) { return WD_CHIP_LABEL[w]; }).join(','));
+    }
+    if (r.replaces) parts.push('แทน ' + esc(nickOf(r.replaces)));
+    return parts.length ? (' · ' + parts.join(' · ')) : '';
   }
 
   function drawSettingsOwner() {
@@ -1086,14 +1338,16 @@
     var groupLabel = { director: 'กรรมการ', staff: 'พนักงาน', temp: 'คนนอก' };
     var peopleRows = ['director', 'staff', 'temp'].map(function (g) {
       return d.people.filter(function (p) { return p.group === g; }).map(function (p) {
-        var normalRate = g === 'staff' ? rateEffective(d.rates, 'normal', p.id) : null;
+        var variants = g === 'staff' ? activeNormalVariants(d.rates, p.id) : [];
         var tempRate = g === 'temp' ? rateEffective(d.rates, 'temp', p.id) : null;
-        var rateTxt = g === 'director' ? '–' : (normalRate ? normalRate.amount : (tempRate ? tempRate.amount : '–'));
+        var rateTxt = g === 'director' ? '–' : (g === 'staff'
+          ? (variants.length ? variants.map(function (v) { return v.amount + rateConditionLabel(v); }).join(' / ') : '–')
+          : (tempRate ? String(tempRate.amount) : '–'));
         var dedTxt = g === 'temp' ? '–' : (g === 'director' ? (todayRates.absent_director == null ? '–' : todayRates.absent_director) : (todayRates.absent_staff == null ? '–' : todayRates.absent_staff));
-        return '<button type="button" class="row-btn" data-act="editPerson" data-id="' + esc(p.id) + '" style="display:grid;grid-template-columns:minmax(0,1fr) 70px 64px 64px;align-items:center">' +
+        return '<button type="button" class="row-btn" data-act="editPerson" data-id="' + esc(p.id) + '" style="display:grid;grid-template-columns:minmax(0,1fr) 70px 96px 64px;align-items:center">' +
           '<span style="font-size:14px;font-weight:500;text-align:left">' + esc(p.nick) + ' <span style="font-size:11px;color:#7A7064">' + esc(p.id) + (p.active ? '' : ' · ปิดใช้งาน') + '</span></span>' +
           '<span><span class="g g-' + (g === 'director' ? 'D' : g === 'staff' ? 'S' : 'T') + '">' + groupLabel[g] + '</span></span>' +
-          '<span style="text-align:right;font-size:14px">' + rateTxt + '</span>' +
+          '<span style="text-align:right;font-size:12px">' + rateTxt + '</span>' +
           '<span style="text-align:right;font-size:14px">' + dedTxt + '</span>' +
           '</button>';
       }).join('');
@@ -1115,28 +1369,33 @@
       '<div class="sec">เรทกลาง</div><div class="card-plain">' + rateHistory + '</div>' +
       '<div class="sec">เพิ่มเรทใหม่</div><div class="card">' + rateFormHtml(d) + '</div>';
 
+    // P5 §4.7: ALL template sets, with badges ใช้อยู่ / อนาคต / ในอดีต. The "จัดช่องอังคาร" section that used
+    // to live here has moved to Calendar/Record (§4.5).
     var effRows = templateEffectiveRows(d.templates);
-    var tplHtml = [1, 2, 3, 4, 5, 6, 0].map(function (wd) {
-      var chips = tplWeekdayChips(effRows, wd).map(function (c) { return '<span class="' + c.cls + '">' + esc(c.l) + '</span>'; }).join('');
-      return '<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 14px;border-top:1px solid #F0EAE0"><span style="width:52px;flex-shrink:0;font-size:13px;font-weight:600">' + WD_LABEL_SHORT[wd] + '</span><div style="display:flex;flex-wrap:wrap;gap:4px">' + chips + '</div></div>';
+    var currentEff = effRows.length ? effRows[0].effective_from : null;
+    var setsByEff = {};
+    (d.templates || []).forEach(function (t) { (setsByEff[t.effective_from] = setsByEff[t.effective_from] || []).push(t); });
+    var allEffs = Object.keys(setsByEff).sort().reverse();
+    var tplListHtml = allEffs.map(function (eff) {
+      var badge = eff === currentEff ? { l: 'ใช้อยู่', cls: 'p-sub' } : (eff > state.today ? { l: 'อนาคต', cls: 'p-adh' } : { l: 'ในอดีต', cls: 'p-base' });
+      var isFuture = eff > state.today;
+      var isOnly = allEffs.length <= 1;
+      var open = settingsState.tplViewEff === eff;
+      var weekdaysHtml = '';
+      if (open) {
+        weekdaysHtml = [1, 2, 3, 4, 5, 6, 0].map(function (wd) {
+          var chips = tplWeekdayChips(setsByEff[eff], wd).map(function (c) { return '<span class="' + c.cls + '">' + esc(c.l) + '</span>'; }).join('');
+          return '<div style="display:flex;gap:10px;align-items:flex-start;padding:6px 0"><span style="width:48px;flex-shrink:0;font-size:12px;font-weight:600">' + WD_LABEL_SHORT[wd] + '</span><div style="display:flex;flex-wrap:wrap;gap:4px">' + (chips || '<span style="font-size:11px;color:#7A7064">—</span>') + '</div></div>';
+        }).join('');
+      }
+      return '<div style="border-top:1px solid #F0EAE0">' +
+        '<button type="button" class="row-btn" data-act="viewTplSet" data-eff="' + eff + '"><span style="font-size:14px;font-weight:500">มีผลตั้งแต่ ' + esc(eff) + '</span><span class="pill ' + badge.cls + '">' + badge.l + '</span></button>' +
+        (open ? '<div style="padding:0 14px 10px">' + weekdaysHtml + (isFuture && !isOnly ? '<button type="button" class="btn-outline" style="margin-top:6px;color:#9B1C12;border-color:#F2AEA3" data-act="deleteTemplateSet" data-eff="' + eff + '">ลบแม่แบบชุดนี้</button>' : '') + '</div>' : '') +
+        '</div>';
     }).join('');
     var tplSection =
-      '<div class="sec">แม่แบบเวร</div><div class="card-plain">' + tplHtml +
-      '<button type="button" class="row-btn" data-act="openTplEditor" style="color:#9A4F0E;justify-content:center;font-weight:600">แก้แม่แบบ</button></div>';
-
-    var tueDates = datesOfMonth(state.ym).filter(function (d2) { return weekdayOf(d2) === 2; });
-    var tueAllowedPeople = state.tueAllowed.map(function (id) { return personById(id); }).filter(Boolean);
-    var tueRows = tueDates.map(function (dt) {
-      var slot = settingsState.tueSlots.find(function (s) { return s.date === dt; });
-      var current = slot ? slot.person_id : '';
-      var opts = '<option value=""' + (current === '' ? ' selected' : '') + '>— ยังไม่จัด —</option>' + tueAllowedPeople.map(function (p) {
-        return '<option value="' + p.id + '"' + (current === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>';
-      }).join('');
-      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;border-top:1px solid #F0EAE0"><span style="font-size:14px;font-weight:500">อ. ' + Number(dt.slice(8, 10)) + ' ' + esc(THAI_MONTH_SHORT[Number(state.ym.slice(5, 7)) - 1]) + '</span><select data-onchange="setTueSlot" data-date="' + dt + '">' + opts + '</select></div>';
-    }).join('');
-    var tueSection =
-      '<div class="sec">จัดช่องอังคาร ' + esc(ymLabel(state.ym)) + ' (วันฐานของ ' + esc(tueAllowedPeople.map(function (p) { return p.nick; }).join('/')) + ')</div>' +
-      '<div class="card-plain">' + tueRows + '</div>';
+      '<div class="sec">แม่แบบเวร</div><div class="card-plain">' + tplListHtml +
+      '<button type="button" class="row-btn" data-act="openTplEditor" style="color:#9A4F0E;justify-content:center;font-weight:600;border-top:1px solid #F0EAE0">+ สร้างแม่แบบใหม่</button></div>';
 
     var openMonths = [];
     var baseYm = state.today.slice(0, 7);
@@ -1167,7 +1426,7 @@
       '<div class="shell">' + headerHtml('ตั้งค่า') +
       '<main class="app-main">' +
       '<div class="owner-banner"><div style="flex-grow:1"><div style="font-size:14px;font-weight:600">โหมด Owner</div><div style="font-size:12px;color:#CFC5B5">ปลดล็อกด้วยรหัส Owner</div></div></div>' +
-      peopleSection + rateSection + tplSection + tueSection + closeSection + systemSection +
+      peopleSection + rateSection + tplSection + closeSection + systemSection +
       '</main>' + navHtml('settings') +
       (settingsState.modal || '') +
       '</div>';
@@ -1187,29 +1446,42 @@
       if (field === 'group') { settingsState.modal = personModalHtml(); drawSettingsOwner(); }
     };
     actions.setPersonCheck = function (el) { settingsState.personForm[el.getAttribute('data-field')] = el.checked; };
-    actions.savePersonForm = function () {
+    actions.savePersonForm = function (el) {
       var f = settingsState.personForm;
       if (!f.nick) { toast('กรุณาใส่ชื่อเล่น'); return; }
       var payload = { nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
       if (f.id) payload.id = f.id;
-      api('savePerson', payload).then(function () {
+      withSavingButton(el, function () { return api('savePerson', payload).then(function () {
         toast('บันทึกแล้ว');
         settingsState.modal = '';
         renderSettings();
-      });
+      }); });
     };
     actions.setRateKind = function (el) { settingsState.addRate.kind = el.value; settingsState.addRate.person_id = ''; drawSettingsOwner(); };
     actions.setRatePerson = function (el) { settingsState.addRate.person_id = el.value; };
     actions.setRateAmt = function (el) { settingsState.addRate.amount = el.value; };
     actions.setRateEff = function (el) { settingsState.addRate.effective_from = el.value; };
-    actions.submitRate = function () {
+    actions.toggleRateWeekday = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var f = settingsState.addRate;
+      f.weekdays = f.weekdays || [];
+      var idx = f.weekdays.indexOf(wd);
+      if (idx === -1) f.weekdays.push(wd); else f.weekdays.splice(idx, 1);
+      drawSettingsOwner();
+    };
+    actions.setRateReplaces = function (el) { settingsState.addRate.replaces = el.value; };
+    actions.submitRate = function (el) {
       var f = settingsState.addRate;
       if (!f.amount || !f.effective_from) { toast('กรุณากรอกจำนวนเงินและวันที่มีผล'); return; }
-      api('addRate', { kind: f.kind, person_id: f.person_id || '', amount: Number(f.amount), effective_from: f.effective_from }).then(function () {
+      withSavingButton(el, function () { return api('addRate', {
+        kind: f.kind, person_id: f.person_id || '', amount: Number(f.amount), effective_from: f.effective_from,
+        weekdays: (f.weekdays || []).join(','), replaces: f.replaces || ''
+      }).then(function () {
+        invalidateAllMonths();
         toast('เพิ่มเรทแล้ว');
-        settingsState.addRate = { kind: 'normal', person_id: '', amount: '', effective_from: '' };
+        settingsState.addRate = { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' };
         renderSettings();
-      });
+      }); });
     };
     actions.openTplEditor = function () { openTemplateEditor(d); };
     actions.toggleTplPerson = function (el) {
@@ -1226,6 +1498,46 @@
       }
     };
     actions.setTplEff = function (el) { settingsState.tplDraft.effective_from = el.value; };
+    actions.toggleTplTue = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var draft = settingsState.tplDraft;
+      if (el.checked) {
+        var already = draft.rows.some(function (r) { return r.weekday === wd && r.kind === 'tue_slot'; });
+        if (!already) {
+          var maxOrder = draft.rows.filter(function (r) { return r.weekday === wd; }).reduce(function (a, r) { return Math.max(a, r.slot_order); }, -1);
+          draft.rows.push({ weekday: wd, slot_order: maxOrder + 1, kind: 'tue_slot', person_id: '', persons: '', alt_anchor: '' });
+        }
+      } else {
+        draft.rows = draft.rows.filter(function (r) { return !(r.weekday === wd && r.kind === 'tue_slot'); });
+      }
+      settingsState.modal = templateModalHtml(d);
+      drawSettingsOwner();
+    };
+    actions.toggleTplAlt = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var draft = settingsState.tplDraft;
+      if (el.checked) {
+        var already = draft.rows.some(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+        if (!already) {
+          var maxOrder = draft.rows.filter(function (r) { return r.weekday === wd; }).reduce(function (a, r) { return Math.max(a, r.slot_order); }, -1);
+          draft.rows.push({ weekday: wd, slot_order: maxOrder + 1, kind: 'alt', person_id: '', persons: '', alt_anchor: '' });
+        }
+      } else {
+        draft.rows = draft.rows.filter(function (r) { return !(r.weekday === wd && r.kind === 'alt'); });
+      }
+      settingsState.modal = templateModalHtml(d);
+      drawSettingsOwner();
+    };
+    actions.setTplAltPersons = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var row = settingsState.tplDraft.rows.find(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+      if (row) row.persons = el.value;
+    };
+    actions.setTplAltAnchor = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var row = settingsState.tplDraft.rows.find(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+      if (row) row.alt_anchor = el.value;
+    };
     actions.saveTemplateForm = function () {
       var draft = settingsState.tplDraft;
       if (!draft.effective_from) { toast('กรุณาเลือกวันมีผล'); return; }
@@ -1233,37 +1545,42 @@
         effective_from: draft.effective_from,
         rows: draft.rows.map(function (r, idx) { return { weekday: r.weekday, slot_order: idx, kind: r.kind, person_id: r.person_id || '', persons: r.persons || '', alt_anchor: r.alt_anchor || '' }; })
       }).then(function () {
+        invalidateAllMonths();
         toast('บันทึกแม่แบบแล้ว');
         settingsState.modal = '';
         renderSettings();
       });
     };
-    actions.setTueSlot = function (el) {
-      api('setTueSlot', { date: el.getAttribute('data-date'), person_id: el.value }).then(function () {
-        toast('บันทึกช่องอังคารแล้ว');
+    actions.deleteTemplateSet = function (el) {
+      var eff = el.getAttribute('data-eff');
+      if (!window.confirm('ลบแม่แบบที่มีผลตั้งแต่ ' + eff + ' ใช่หรือไม่')) return;
+      withSavingButton(el, function () { return api('deleteTemplateSet', { effective_from: eff }).then(function () {
+        invalidateAllMonths();
+        toast('ลบแม่แบบแล้ว');
         renderSettings();
-      });
+      }); });
     };
+    actions.viewTplSet = function (el) { settingsState.tplViewEff = (settingsState.tplViewEff === el.getAttribute('data-eff')) ? '' : el.getAttribute('data-eff'); drawSettingsOwner(); };
     actions.closePeriod = function (el) {
       var ym2 = el.getAttribute('data-ym');
       if (!window.confirm('ปิดงวด ' + ym2 + ' แล้วจะแก้ไม่ได้อีก')) return;
-      api('closePeriod', { ym: ym2 }).then(function () { toast('ปิดงวดแล้ว'); renderSettings(); });
+      withSavingButton(el, function () { return api('closePeriod', { ym: ym2 }).then(function () { invalidateMonth(ym2); toast('ปิดงวดแล้ว'); renderSettings(); }); });
     };
     actions.openPwForm = function (el) { openPasswordModal(el.getAttribute('data-which')); };
     actions.setPw1 = function (el) { settingsState.pw1 = el.value; };
     actions.setPw2 = function (el) { settingsState.pw2 = el.value; };
-    actions.submitPwChange = function () {
+    actions.submitPwChange = function (el) {
       if ((settingsState.pw1 || '').length < 4) { toast('รหัสผ่านต้องยาวอย่างน้อย 4 ตัวอักษร'); return; }
       if (settingsState.pw1 !== settingsState.pw2) { toast('รหัสผ่านไม่ตรงกัน'); return; }
-      api('changePassword', { which: settingsState.pwWhich, newPassword: settingsState.pw1 }).then(function () {
+      withSavingButton(el, function () { return api('changePassword', { which: settingsState.pwWhich, newPassword: settingsState.pw1 }).then(function () {
         toast('เปลี่ยนรหัสแล้ว');
         settingsState.modal = '';
         if (settingsState.pwWhich === state.role) doLogout();
         else renderSettings();
-      });
+      }); });
     };
-    actions.resyncCalendar = function () {
-      api('resyncCalendar', {}).then(function (res) { toast('ซิงก์แล้ว: สำเร็จ ' + res.synced + ' · ล้มเหลว ' + res.failed); });
+    actions.resyncCalendar = function (el) {
+      withSavingButton(el, function () { return api('resyncCalendar', {}).then(function (res) { toast('ซิงก์แล้ว: สำเร็จ ' + res.synced + ' · ล้มเหลว ' + res.failed); }); });
     };
     actions.logout = doLogout;
   }
@@ -1296,9 +1613,21 @@
       '</div></div>';
   }
 
+  function firstDayOfNextMonth(ymd) {
+    var y = Number(ymd.slice(0, 4)), m = Number(ymd.slice(5, 7)) + 1;
+    if (m > 12) { m = 1; y++; }
+    return y + '-' + pad2(m) + '-01';
+  }
+
+  // P5 §4.7: "สร้างแม่แบบใหม่" opens the editor prefilled from the latest set, effective_from defaulting
+  // to the first day of next month. The editor also allows editing tue_slot presence and the alt slot
+  // (persons list + anchor date) per weekday.
   function openTemplateEditor(d) {
     var effRows = templateEffectiveRows(d.templates);
-    settingsState.tplDraft = { effective_from: '', rows: effRows.map(function (r) { return Object.assign({}, r); }) };
+    settingsState.tplDraft = {
+      effective_from: firstDayOfNextMonth(state.today),
+      rows: effRows.map(function (r) { return Object.assign({}, r); })
+    };
     settingsState.modal = templateModalHtml(d);
     drawSettingsOwner();
   }
@@ -1308,19 +1637,24 @@
     var weekdaysHtml = [1, 2, 3, 4, 5, 6, 0].map(function (wd) {
       var rows = draft.rows.filter(function (r) { return r.weekday === wd; });
       var fixedIds = rows.filter(function (r) { return r.kind === 'fixed'; }).map(function (r) { return r.person_id; });
-      var special = rows.filter(function (r) { return r.kind !== 'fixed'; }).map(function (r) {
-        return r.kind === 'tue_slot' ? 'ช่องอังคาร' : ('ศุกร์เว้นศุกร์ (' + (r.persons || '') + ')');
-      }).join(', ');
+      var hasTue = rows.some(function (r) { return r.kind === 'tue_slot'; });
+      var altRow = rows.find(function (r) { return r.kind === 'alt'; });
       var checks = people.map(function (p) {
         return '<label class="checkbox-row" style="margin-top:4px"><input type="checkbox" data-onchange="toggleTplPerson" data-wd="' + wd + '" data-id="' + p.id + '" ' + (fixedIds.indexOf(p.id) !== -1 ? 'checked' : '') + '>' + esc(p.nick) + '</label>';
       }).join('');
       return '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #F0EAE0"><div style="font-size:13px;font-weight:600">' + WD_LABEL_SHORT[wd] + '</div>' +
-        (special ? '<div style="font-size:11px;color:#7A7064;margin-top:2px">คงเดิม: ' + esc(special) + '</div>' : '') +
-        checks + '</div>';
+        checks +
+        '<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" data-onchange="toggleTplTue" data-wd="' + wd + '" ' + (hasTue ? 'checked' : '') + '>ช่องอังคาร (tue_slot)</label>' +
+        '<label class="checkbox-row" style="margin-top:6px"><input type="checkbox" data-onchange="toggleTplAlt" data-wd="' + wd + '" ' + (altRow ? 'checked' : '') + '>ศุกร์เว้นศุกร์ (alt)</label>' +
+        (altRow ? '<div style="display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:8px;margin-top:6px">' +
+          '<input data-oninput="setTplAltPersons" data-wd="' + wd + '" placeholder="รหัสคน คั่นด้วย , เช่น 0003,0010" value="' + esc(altRow.persons || '') + '" style="height:40px">' +
+          '<input type="date" data-oninput="setTplAltAnchor" data-wd="' + wd + '" value="' + esc(altRow.alt_anchor || '') + '" style="height:40px">' +
+          '</div>' : '') +
+        '</div>';
     }).join('');
     return '<div class="modal-backdrop" data-act="closeModalBg"><div class="modal-sheet" data-act="stop">' +
-      '<div style="font-size:16px;font-weight:600">แก้แม่แบบเวร</div>' +
-      '<div style="font-size:12px;color:#6B6257;margin-top:4px">ติ๊กเพื่อเพิ่ม/ลดคนใน slot คงที่ (fixed) ต่อวัน · ช่องอังคารและศุกร์เว้นศุกร์คงเดิมอัตโนมัติ</div>' +
+      '<div style="font-size:16px;font-weight:600">สร้างแม่แบบเวรใหม่</div>' +
+      '<div style="font-size:12px;color:#6B6257;margin-top:4px">ติ๊กเพื่อเพิ่ม/ลดคนใน slot คงที่ (fixed) ต่อวัน · แก้ไขช่องอังคาร (tue_slot) และศุกร์เว้นศุกร์ (alt) ได้เช่นกัน</div>' +
       '<div class="form-row"><label for="tplEff">มีผลตั้งแต่วันที่</label><input id="tplEff" type="date" data-oninput="setTplEff" value="' + esc(draft.effective_from) + '"></div>' +
       weekdaysHtml +
       '<button type="button" class="btn-primary" style="margin-top:14px" data-act="saveTemplateForm">บันทึกแม่แบบใหม่</button>' +
@@ -1346,15 +1680,34 @@
 
   // ================= BOOT =================
   function boot() {
+    // P5 §4.2: if a previous month view is cached in localStorage, paint it immediately (using the
+    // last-known people list too, so nicks resolve) before the network round-trip completes.
+    var lastMonth = lsGetJSON('sl_last_month'); // { ym, month }
+    var lastPeople = lsGetJSON('sl_last_people');
+    var lastToday = lsGet('sl_last_today');
+    if (lastMonth && lastMonth.ym && lastMonth.month) {
+      state.ym = lastMonth.ym;
+      state.monthCache[lastMonth.ym] = lastMonth.month;
+    }
+    if (lastPeople) state.people = lastPeople;
+    if (lastToday) state.today = lastToday;
+
     if (state.token) {
-      api('bootstrap', {}).then(function (data) {
+      if (lastMonth && state.people.length) route(); // instant paint from cache
+      api('bootstrap', { ym: state.ym || undefined }).then(function (data) {
         state.role = data.role; state.who = data.who;
         state.people = data.people; state.appUsers = data.appUsers;
         state.tueAllowed = data.tueAllowed; state.today = data.today;
-        state.ym = state.today.slice(0, 7);
+        if (!state.ym) state.ym = state.today.slice(0, 7);
         state.users = data.appUsers;
         lsSetJSON('sl_users', state.appUsers);
+        lsSetJSON('sl_last_people', data.people);
+        lsSet('sl_last_today', data.today);
         lsSet('sl_role', state.role); lsSet('sl_who', state.who);
+        if (data.month) {
+          state.monthCache[data.month.ym] = data.month;
+          lsSetJSON('sl_last_month', { ym: data.month.ym, month: data.month });
+        }
         route();
       }).catch(function () { route(); });
     } else {

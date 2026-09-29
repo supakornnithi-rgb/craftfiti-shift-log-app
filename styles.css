@@ -91,7 +91,7 @@ button, .tap-target { min-height: 44px; }
 .tab-on { color: var(--ink); font-weight: 600; }
 
 /* ---------- calendar chips / pills ---------- */
-.chip { font-size: 11px; line-height: 15px; font-weight: 500; padding: 0 3px; border-radius: 4px; letter-spacing: .2px; }
+.chip { font-size: 10px; line-height: 13px; font-weight: 500; padding: 0 3px; border-radius: 4px; letter-spacing: .2px; display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-base { background: #ECE5D8; color: #4A4238; }
 .st-abs { background: #FBE1DC; color: #9B1C12; text-decoration: line-through; }
 .st-hab { background: #FBE1DC; color: #9B1C12; }
@@ -152,8 +152,27 @@ button, .tap-target { min-height: 44px; }
   background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 10px; font-size: 13px;
   max-width: 90vw; z-index: 50; box-shadow: 0 6px 18px rgba(0,0,0,.25);
 }
-.loading-bar { position: fixed; top: 0; left: 0; right: 0; height: 3px; background: var(--accent); z-index: 60; animation: loading-pulse 1s ease-in-out infinite; }
-@keyframes loading-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+.loading-bar-wrap { position: fixed; top: 0; left: 0; right: 0; z-index: 80; transition: opacity .3s ease; }
+.loading-bar-track { height: 3px; background: transparent; }
+.loading-bar-fill { height: 3px; background: var(--accent); width: 0%; transition: width .15s ease; }
+.loading-bar-label { position: fixed; top: 6px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); font-size: 11px; padding: 3px 10px; border-radius: 999px; z-index: 80; }
+.tap-lock-overlay { position: fixed; inset: 0; z-index: 79; background: transparent; pointer-events: auto; }
+
+/* ---------- calendar: display-mode toggle ---------- */
+.calmode-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; background: #EAE3D6; border-radius: 13px; margin: 10px 0 2px; }
+.calmode-btn { height: 40px; border-radius: 10px; font-size: 13px; font-weight: 500; color: #5E554A; }
+.calmode-on { background: #FFFFFF; color: var(--ink); font-weight: 600; }
+
+/* cell chip stack: one chip per line */
+.cell-chips { display: flex; flex-direction: column; gap: 1px; width: 100%; overflow: hidden; }
+.cell-noev { font-size: 11px; color: var(--muted2); }
+
+/* ---------- day pop-up (P5 §4.1) ---------- */
+.day-modal-close { position: absolute; top: 12px; right: 12px; width: 32px; height: 32px; border-radius: 50%; background: #F0EAE0; display: flex; align-items: center; justify-content: center; }
+
+/* ---------- Tuesday slot control (P5 §4.5) ---------- */
+.tue-ctl { margin-top: 10px; padding: 12px; border-radius: 12px; background: #FFF7EA; border: 1px dashed #B8641A; }
+.tue-ctl-disabled { opacity: .55; }
 
 /* ---------- login ---------- */
 .login-wrap { padding: 72px 24px 40px; display: flex; flex-direction: column; flex-grow: 1; }
@@ -182,8 +201,10 @@ button, .tap-target { min-height: 44px; }
 .seg-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .seg-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .seg-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.sg { height: 44px; border-radius: 10px; font-size: 13px; font-weight: 500; color: #5E554A; border: 1px solid transparent; }
+.seg-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.sg { height: 44px; border-radius: 10px; font-size: 12px; font-weight: 500; color: #5E554A; border: 1px solid transparent; padding: 0 2px; }
 .sg-on { background: #FFFFFF; color: var(--ink); border-color: #DCD3C4; font-weight: 600; }
+.sg:disabled { opacity: .4; cursor: not-allowed; }
 .date-row { width: 100%; height: 52px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; background: #FFFFFF; border: 1px solid var(--line); border-radius: 12px; }
 .warn-box { padding: 12px 14px; border-radius: 12px; background: #FBE8C4; color: #744400; font-size: 13px; margin-top: 8px; }
 .error-box { padding: 12px 14px; border-radius: 12px; background: #FBE1DC; color: #9B1C12; font-size: 13px; margin-top: 8px; }
