@@ -923,9 +923,11 @@ function monthStats(ym, data) {
     .map(function (p) {
       var s = statMap[p.id];
       var schAbs = s.abs - s.absOff; // absences against scheduled shifts only
-      var wrk = s.sch - schAbs - s.emg + s.sub + s.adh;
+      var onDuty = s.sch - schAbs - s.emg;
+      var extra = Math.max(0, s.sub + s.adh - s.absOff);
+      var wrk = onDuty + extra;
       var att = s.sch > 0 ? Math.round((s.sch - schAbs - s.emg) / s.sch * 100) : null;
-      return { id: s.id, nick: s.nick, group: s.group, sch: s.sch, wrk: wrk, att: att, abs: s.abs, absOff: s.absOff, emg: s.emg, sub: s.sub, adh: s.adh, swp: s.swp };
+      return { id: s.id, nick: s.nick, group: s.group, sch: s.sch, onDuty: onDuty, extra: extra, wrk: wrk, att: att, abs: s.abs, absOff: s.absOff, emg: s.emg, sub: s.sub, adh: s.adh, swp: s.swp };
     });
 
   var team = rows.reduce(function (acc, r) {
@@ -933,7 +935,9 @@ function monthStats(ym, data) {
     return acc;
   }, { sch: 0, abs: 0, absOff: 0, emg: 0, sub: 0, adh: 0, swp: 0 });
   var teamSchAbs = team.abs - team.absOff;
-  team.wrk = team.sch - teamSchAbs - team.emg + team.sub + team.adh;
+  team.onDuty = rows.reduce(function (a, r) { return a + r.onDuty; }, 0);
+  team.extra = rows.reduce(function (a, r) { return a + r.extra; }, 0);
+  team.wrk = team.onDuty + team.extra;
   team.att = team.sch > 0 ? Math.round((team.sch - teamSchAbs - team.emg) / team.sch * 100) : null;
 
   var temps = Object.keys(tempsMap).map(function (k) { return tempsMap[k]; });

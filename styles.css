@@ -239,7 +239,7 @@ button, .tap-target { min-height: 44px; }
 .fchip { height: 44px; padding: 0 14px; border-radius: 999px; border: 1px solid #D9D0C1; background: #FFFFFF; font-size: 13px; font-weight: 500; }
 .fchip-on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .stats-scroll { overflow-x: auto; background: #FFFFFF; border: 1px solid var(--line); border-radius: 14px; }
-.trow { display: grid; grid-template-columns: 96px repeat(8, 56px); border-top: 1px solid var(--line-soft); min-width: 544px; }
+.trow { display: grid; grid-template-columns: 96px repeat(9, 64px); border-top: 1px solid var(--line-soft); min-width: 672px; }
 .tname { position: sticky; left: 0; z-index: 1; background: #FFFFFF; border-right: 1px solid #EAE3D6; padding: 5px 8px; display: flex; flex-direction: column; justify-content: center; min-height: 44px; box-sizing: border-box; }
 .th { height: 48px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: var(--muted); line-height: 1.2; text-align: center; }
 .th-on { color: var(--ink); background: var(--paper); }

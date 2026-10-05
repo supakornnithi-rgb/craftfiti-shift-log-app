@@ -1394,9 +1394,9 @@
 
   // ================= STATS =================
   var statsState = { grp: 'all', sort: 'sub' };
-  var HEAT = { att: 'red', abs: 'red', emg: 'blu', sub: 'grn', adh: 'amb', swp: 'vio' };
-  var COLS = ['sch', 'wrk', 'att', 'abs', 'emg', 'sub', 'adh', 'swp'];
-  var COL_LABEL = { sch: 'เวร', wrk: 'มาจริง', att: '% มา', abs: 'ขาด', emg: 'ลา<br>ฉุกเฉิน', sub: 'เข้าแทน', adh: 'AdHoc', swp: 'สลับ' };
+  var HEAT = { att: 'red', extra: 'grn', abs: 'red', emg: 'blu', sub: 'grn', adh: 'amb', swp: 'vio' };
+  var COLS = ['sch', 'onDuty', 'att', 'extra', 'abs', 'emg', 'sub', 'adh', 'swp'];
+  var COL_LABEL = { sch: 'เวรตามตาราง', onDuty: 'มาตามเวร', att: '% มาตามเวร', extra: 'มาช่วยเพิ่ม', abs: 'ขาด', emg: 'ลาฉุกเฉิน', sub: 'เข้าแทน', adh: 'AdHoc', swp: 'สลับ' };
 
   function renderStats() {
     drawStats(localStats(state.ym)); // P8: computed locally, no request
@@ -1415,7 +1415,7 @@
     });
     function cellInfo(r, k) {
       var raw = k === 'att' ? (r.att == null ? null : 100 - r.att) : r[k];
-      var displayVal = k === 'att' ? (r.att == null ? '–' : r.att + '%') : (r[k] === 0 ? '–' : numFmt(r[k]));
+      var displayVal = k === 'att' ? (r.att == null ? '–' : r.att + '%') : ((r[k] === 0 || (r.sch === 0 && (k === 'sch' || k === 'onDuty'))) ? '–' : numFmt(r[k]));
       if (!HEAT[k]) return { t: displayVal, cls: 'tc n0' };
       if (raw == null || raw <= 0) return { t: (k === 'att' ? displayVal : '–'), cls: 'tc z' };
       var lvl = Math.max(1, Math.ceil(raw / (maxes[k] || 1) * 4));
@@ -1435,16 +1435,19 @@
     }).join('');
     var team = stats.team;
     var teamRowHtml = '<div class="trow" style="background:#F8F4EC;border-top:1px solid #DCD3C4"><div class="tname" style="background:#F8F4EC"><span style="font-size:13px;font-weight:600">รวมทีม</span><span style="font-size:11px;color:#7A7064">' + list.length + ' คน</span></div>' +
-      '<div class="tc">' + team.sch + '</div><div class="tc">' + numFmt(team.wrk) + '</div><div class="tc">' + (team.att == null ? '–' : team.att + '%') + '</div><div class="tc">' + numFmt(team.abs) + '</div><div class="tc">' + numFmt(team.emg) + '</div><div class="tc">' + numFmt(team.sub) + '</div><div class="tc">' + numFmt(team.adh) + '</div><div class="tc">' + team.swp + '</div></div>';
+      [team.sch, team.onDuty, null, team.extra, team.abs, team.emg, team.sub, team.adh, team.swp].map(function (v, i) {
+        if (i === 2) return '<div class="tc">' + (team.att == null ? '–' : team.att + '%') + '</div>';
+        return '<div class="tc">' + (v === 0 ? '–' : numFmt(v)) + '</div>';
+      }).join('') + '</div>';
 
     var top = stats.rows.slice().sort(function (a, b) { return (b.sub + b.adh) - (a.sub + a.adh); });
     var bestVal = top.length ? top[0].sub + top[0].adh : 0;
     var kpiHelpBest = bestVal > 0 ? top.filter(function (r) { return (r.sub + r.adh) === bestVal; }).map(function (r) { return r.nick; }).join(', ') : '—';
 
     var kpis = [
-      { l: 'มาตามเวร (ทีม)', v: (team.att == null ? '–' : team.att + '%'), s: numFmt(team.sch - team.abs - team.emg) + ' จาก ' + team.sch + ' วันเวร' },
+      { l: 'มาตามเวร (ทีม)', v: (team.att == null ? '–' : team.att + '%'), s: numFmt(team.onDuty) + ' จาก ' + team.sch + ' วันเวร' },
       { l: 'ขาด · ลาฉุกเฉิน', v: numFmt(team.abs) + ' · ' + numFmt(team.emg), s: 'หน่วยเป็นวัน' },
-      { l: 'เข้าแทน + AdHoc', v: numFmt(team.sub + team.adh), s: 'ช่วยร้านมากสุด: ' + esc(kpiHelpBest) },
+      { l: 'มาช่วยเพิ่ม (เข้าแทน + AdHoc)', v: numFmt(team.extra), s: 'ช่วยร้านมากสุด: ' + esc(kpiHelpBest) },
       { l: 'สลับวัน', v: String(team.swp / 2), s: 'คู่ · ไม่มีผลต่อเงิน' }
     ];
     var kpiHtml = kpis.map(function (k) { return '<div class="kpi"><div class="l">' + k.l + '</div><div class="v">' + k.v + '</div><div class="s">' + k.s + '</div></div>'; }).join('');
@@ -1472,7 +1475,7 @@
       '<div style="padding:8px 12px;background:#F8F4EC;font-size:11px;font-weight:600;color:#6B6257">คนนอก (จ้างชั่วคราว) · ไม่นับรวมในตารางทีม</div>' +
       tempsHtml +
       '</div>' +
-      '<div style="font-size:11px;color:#7A7064;margin-top:6px;line-height:1.6">% มา = วันที่มาตามเวรของตัวเอง ÷ วันตามตาราง (สีแดงยิ่งเข้ม = มาน้อยกว่าเวรมาก) · สลับวันไม่นับเป็นขาด · หน้านี้ไม่แสดงตัวเลขเงิน ดูได้ที่ "สรุปเงิน"</div>' +
+      '<div style="font-size:11px;color:#7A7064;margin-top:6px;line-height:1.6">มาตามเวร = เวร − ขาด − ลาฉุกเฉิน · % มาตามเวร = มาตามเวร ÷ เวรตามตาราง · มาช่วยเพิ่ม = เข้าแทน + AdHoc (หักขาดนอกตาราง) · สลับวันไม่นับเป็นขาด · หน้านี้ไม่แสดงตัวเลขเงิน</div>' +
       '</main>' +
       navHtml('stats') +
       '</div>';
