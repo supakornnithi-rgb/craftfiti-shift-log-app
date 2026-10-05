@@ -2170,7 +2170,20 @@
   });
 
   if (location.search.indexOf('mock=1') === -1 && 'serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(function () { /* ignore */ });
+    // updateViaCache:'none' = always re-check sw.js itself; check again whenever the installed app resumes,
+    // and reload once when a new version takes over so the phone shows it without a reinstall.
+    var hadController = !!navigator.serviceWorker.controller;
+    var reloadedForSw = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController || reloadedForSw) return;
+      reloadedForSw = true;
+      location.reload();
+    });
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(function (reg) {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') reg.update().catch(function () { /* ignore */ });
+      });
+    }).catch(function () { /* ignore */ });
   }
 
   if (document.readyState === 'loading') {
