@@ -1491,6 +1491,43 @@
     drawPayout(localPayout(state.ym)); // P8: computed locally (tempPaid + closed come from the bundle)
   }
 
+  // P11: position-bonus card (above the export card). Amounts only; ids/nicks come from the bundle.
+  function posBonusCardHtml(payout) {
+    var pb = payout.posBonus;
+    if (!pb) return '';
+    var shortYm = window.monthShortYear;
+    var nickOf = function (id) {
+      var p = (state.bundle.people || []).filter(function (x) { return x.id === id; })[0];
+      return p ? p.nick : id;
+    };
+    var personRows = function (amount) {
+      return (pb.people || []).map(function (id) {
+        return '<div style="display:flex;justify-content:space-between;font-size:14px;padding:3px 0"><span>' + esc(nickOf(id)) + '</span><span style="font-weight:600">' + money2(amount) + '</span></div>';
+      }).join('');
+    };
+    var html = '';
+    var isPayMonth = !!window.bonusPaidQuarterFor(payout.ym);
+    if (pb.error) {
+      html += '<div style="font-size:12px;color:#9A4F0E;line-height:1.6">' + esc(pb.error) + (isPayMonth ? '<br>ยังไม่รวมค่าตำแหน่งใน CSV' : '') + '</div>';
+    }
+    if (pb.paying) {
+      html += '<div style="font-size:13px;font-weight:600;margin-top:2px">ค่าตำแหน่ง จ่ายเดือนนี้ (รอบ ' + esc(shortYm(pb.paying.startYm)) + '–' + esc(shortYm(pb.paying.endYm)) + ')</div>' +
+        personRows(pb.paying.amount) +
+        '<div style="font-size:11px;color:#6B6257;margin-top:2px">อยู่ในไฟล์ export คอลัมน์ position_pay</div>';
+    }
+    var acc = pb.accumulating;
+    var tm = acc.thisMonth || { amount: 0, reason: 'missing_month' };
+    var status = tm.reason === 'ok' ? 'เดือนนี้ +' + money2(tm.amount)
+      : tm.reason === 'below_target' ? 'เดือนนี้ยังไม่ถึงเงื่อนไข: ยอดยังไม่เกินเป้า'
+      : tm.reason === 'ebitda_negative' ? 'เดือนนี้ยังไม่ถึงเงื่อนไข: Accum. EBITDA ติดลบ'
+      : 'ไม่พบข้อมูลเดือนในชีต';
+    html += '<div style="font-size:13px;font-weight:600;margin-top:' + (pb.paying ? '12' : '2') + 'px">กำลังสะสม รอบ ' + esc(shortYm(acc.startYm)) + '–' + esc(shortYm(acc.endYm)) + ' → จ่าย ' + esc(shortYm(acc.payYm)) + '</div>' +
+      personRows(acc.amountSoFar) +
+      '<div style="font-size:11px;color:#6B6257;margin-top:2px">' + esc(status) + ' · ยังไม่อยู่ใน CSV</div>';
+    return '<div style="margin:16px 2px 8px;font-size:12px;font-weight:600;color:#6B6257">ค่าตำแหน่ง</div>' +
+      '<div class="card-plain" style="padding:10px 14px">' + html + '</div>';
+  }
+
   function drawPayout(payout) {
     var ym = state.ym;
     var peopleHtml = payout.people.map(function (p) {
@@ -1561,11 +1598,12 @@
       '<div style="display:flex;justify-content:space-between;font-size:15px;color:#9B1C12;margin-top:2px"><span>ค้างจ่าย</span><span style="font-weight:600">' + money2(payout.tempUnpaidTotal) + '</span></div></div>' +
       '</div>' +
       '</div>' +
+      posBonusCardHtml(payout) +
       '<div class="export-card">' +
-      '<div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:15px;font-weight:600">Export ไประบบเงินเดือน</div><div style="font-size:12px;color:#CFC5B5;margin-top:2px">' + esc(payout.filename) + ' · ' + payout.people.length + ' คน · จับคู่ด้วยรหัสพนักงาน</div></div></div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:15px;font-weight:600">Export ไประบบเงินเดือน</div><div style="font-size:12px;color:#CFC5B5;margin-top:2px">' + esc(payout.filename) + ' · ' + (payout.csv.split(String.fromCharCode(10)).length - 1) + ' คน · จับคู่ด้วยรหัสพนักงาน</div></div></div>' +
       '<div class="csv-pre">' + esc(payout.csv) + '</div>' +
       '<button type="button" class="btn-secondary" style="background:#F4EFE6;color:#1F1A14;margin-top:10px" data-act="downloadCsv">ดาวน์โหลด CSV</button>' +
-      '<div style="font-size:11px;color:#CFC5B5;margin-top:8px;line-height:1.6">ไปที่ Payroll Dashboard → "นำเข้า Shift Log" → เลือกไฟล์นี้ ระบบจะเติมช่อง รายได้อื่นๆ และ ขาดงาน ให้อัตโนมัติเมื่อเลือกพนักงาน</div>' +
+      '<div style="font-size:11px;color:#CFC5B5;margin-top:8px;line-height:1.6">ไปที่ Payroll Dashboard → "นำเข้า Shift Log" → เลือกไฟล์นี้ ระบบจะเติมช่อง รายได้อื่นๆ และ ขาดงาน' + (/position_pay/.test(payout.csv) ? ' และ ค่าตำแหน่ง' : '') + ' ให้อัตโนมัติเมื่อเลือกพนักงาน</div>' +
       '</div>' +
       '</main>' +
       navHtml('payout') +

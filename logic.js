@@ -760,6 +760,98 @@ function monthAlerts(ym, data) {
 
 // ---------- monthly aggregates ----------
 
+// ---------- position bonus (ค่าตำแหน่ง, P11) ----------
+// Pure: the sheet reading + people ids live in gas/PositionBonus.js and Script Properties.
+
+var BONUS_TARGET = 420000;
+var BONUS_STEP = 10000;
+var BONUS_PER_STEP = 1000;
+var FISCAL_START_MONTH = 6;
+
+function ymAddMonths_(ym, delta) {
+  var parts = ym.split('-');
+  var idx = Number(parts[0]) * 12 + (Number(parts[1]) - 1) + delta;
+  return Math.floor(idx / 12) + '-' + pad2((idx % 12) + 1);
+}
+
+function fiscalStartOf_(ym) {
+  var parts = ym.split('-');
+  var y = Number(parts[0]), m = Number(parts[1]);
+  return (m >= FISCAL_START_MONTH ? y : y - 1) + '-' + pad2(FISCAL_START_MONTH);
+}
+
+// cfMonths: { 'YYYY-MM': { rev, ebitda } } -> { 'YYYY-MM': { amount, reason } }
+function bonusMonthlyAccruals(cfMonths) {
+  var out = {};
+  Object.keys(cfMonths || {}).forEach(function (ym) {
+    var cur = fiscalStartOf_(ym);
+    var accum = 0;
+    var missing = false;
+    var guard = 0;
+    while (guard < 13) {
+      var row = cfMonths[cur];
+      if (!row) { missing = true; break; }
+      accum += Number(row.ebitda) || 0;
+      if (cur === ym) break;
+      cur = ymAddMonths_(cur, 1);
+      guard++;
+    }
+    if (missing) { out[ym] = { amount: 0, reason: 'missing_month' }; return; }
+    if (!(accum > 0)) { out[ym] = { amount: 0, reason: 'ebitda_negative' }; return; }
+    var rev = Number(cfMonths[ym].rev) || 0;
+    var steps = rev > BONUS_TARGET ? Math.floor((rev - BONUS_TARGET) / BONUS_STEP) : 0;
+    if (steps <= 0) { out[ym] = { amount: 0, reason: 'below_target' }; return; }
+    out[ym] = { amount: steps * BONUS_PER_STEP, reason: 'ok' };
+  });
+  return out;
+}
+
+// Quarters follow the fiscal year: Jun-Aug, Sep-Nov, Dec-Feb, Mar-May. Paid the month after the quarter ends.
+function bonusQuarterOf(ym) {
+  var parts = ym.split('-');
+  var m = Number(parts[1]);
+  var offset = (m - FISCAL_START_MONTH + 12) % 3;
+  var startYm = ymAddMonths_(ym, -offset);
+  var months = [startYm, ymAddMonths_(startYm, 1), ymAddMonths_(startYm, 2)];
+  return { months: months, startYm: startYm, endYm: months[2], payYm: ymAddMonths_(months[2], 1) };
+}
+
+function bonusPaidQuarterFor(ym) {
+  var m = Number(ym.split('-')[1]);
+  if (m !== 9 && m !== 12 && m !== 3 && m !== 6) return null;
+  return bonusQuarterOf(ymAddMonths_(ym, -1));
+}
+
+function bonusSumMonths_(months, accruals) {
+  return months.reduce(function (s, mm) {
+    var a = accruals && accruals[mm];
+    return s + (a ? Number(a.amount) || 0 : 0);
+  }, 0);
+}
+
+function bonusSummary(ym, posBonus) {
+  if (!posBonus) return null;
+  var accruals = posBonus.accruals || {};
+  var error = posBonus.error || null;
+  var pq = bonusPaidQuarterFor(ym);
+  var paying = null;
+  if (pq && !error) {
+    paying = { months: pq.months, startYm: pq.startYm, endYm: pq.endYm, amount: bonusSumMonths_(pq.months, accruals) };
+  }
+  var q = bonusQuarterOf(ym);
+  var accMonths = q.months.filter(function (mm) { return mm <= ym; });
+  return {
+    people: posBonus.people || [],
+    paying: paying,
+    accumulating: {
+      months: accMonths, startYm: q.startYm, endYm: q.endYm, payYm: q.payYm,
+      amountSoFar: bonusSumMonths_(accMonths, accruals),
+      thisMonth: accruals[ym] ? { amount: accruals[ym].amount, reason: accruals[ym].reason } : { amount: 0, reason: 'missing_month' }
+    },
+    error: error
+  };
+}
+
 function monthPayout(ym, data) {
   var peopleMap = {};
   var tempsMap = {};
@@ -848,15 +940,31 @@ function monthPayout(ym, data) {
   var csvRows = Object.keys(peopleMap)
     .filter(function (id) { var e = peopleMap[id]; return e.plus > 0 || e.minus > 0; })
     .sort();
-  var csvLines = ['emp_id,nick,other_earn,absent'];
-  csvRows.forEach(function (id) {
-    var e = peopleMap[id];
-    csvLines.push(id + ',' + e.nick + ',' + fmt2(e.plus) + ',' + fmt2(e.minus));
-  });
+  var posSummary = bonusSummary(ym, data.posBonus);
+  var payBonus = !!(posSummary && !posSummary.error && posSummary.paying);
+  var csvLines;
+  if (payBonus) {
+    var bonusIds = posSummary.people || [];
+    bonusIds.forEach(function (id) { if (csvRows.indexOf(id) < 0) csvRows.push(id); });
+    csvRows.sort();
+    csvLines = ['emp_id,nick,other_earn,absent,position_pay'];
+    csvRows.forEach(function (id) {
+      var e = peopleMap[id];
+      var bp = personById(id, data);
+      var nk = e ? e.nick : (bp ? bp.nick : id);
+      csvLines.push(id + ',' + nk + ',' + fmt2(e ? e.plus : 0) + ',' + fmt2(e ? e.minus : 0) + ',' + fmt2(bonusIds.indexOf(id) >= 0 ? posSummary.paying.amount : 0));
+    });
+  } else {
+    csvLines = ['emp_id,nick,other_earn,absent'];
+    csvRows.forEach(function (id) {
+      var e = peopleMap[id];
+      csvLines.push(id + ',' + e.nick + ',' + fmt2(e.plus) + ',' + fmt2(e.minus));
+    });
+  }
   var csv = csvLines.join('\n');
   var filename = 'ShiftLog_' + ym + '.csv';
 
-  return { ym: ym, people: people, temps: temps, totPlus: totPlus, totMinus: totMinus, tempTotal: tempTotal, tempPaidTotal: tempPaidTotal, tempUnpaidTotal: tempUnpaidTotal, csv: csv, filename: filename, carried: carried };
+  return { ym: ym, people: people, temps: temps, totPlus: totPlus, totMinus: totMinus, tempTotal: tempTotal, tempPaidTotal: tempPaidTotal, tempUnpaidTotal: tempUnpaidTotal, csv: csv, filename: filename, carried: carried, posBonus: posSummary };
 }
 
 function monthStats(ym, data) {
@@ -1001,6 +1109,11 @@ if (typeof module !== 'undefined') {
     validateEvent: validateEvent,
     previewEvent: previewEvent,
     monthPayout: monthPayout,
+    bonusMonthlyAccruals: bonusMonthlyAccruals,
+    bonusQuarterOf: bonusQuarterOf,
+    bonusPaidQuarterFor: bonusPaidQuarterFor,
+    bonusSummary: bonusSummary,
+    BONUS_TARGET: BONUS_TARGET,
     monthStats: monthStats,
     monthView: monthView,
     coverOf: coverOf,
