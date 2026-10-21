@@ -855,6 +855,60 @@ function bonusSummary(ym, posBonus) {
   };
 }
 
+// ---------- P13: company-party referral fee ----------
+
+var REFERRAL_PACKAGES = ['A', 'B', 'C'];
+
+function referralKind(pkg) {
+  return 'referral_' + pkg;
+}
+
+// Throws `ไม่พบเรท ...` when no rate is effective on the party date.
+function referralAmount(ref, data) {
+  return rateOn(referralKind(ref.package), null, ref.date, data.rates);
+}
+
+function referralPayPeriod(ref, data) {
+  return ref.pay_period || firstOpenPeriodFrom(ref.date.slice(0, 7), data.periods);
+}
+
+function referralLabel_(ref, amount, ym) {
+  var dateMonth = ref.date.slice(0, 7);
+  var suffix = dateMonth !== ym ? ' (ยกมาจาก ' + monthShortYear(dateMonth) + ')' : '';
+  return thaiShortDate(ref.date) + ' ค่าแนะนำงานเลี้ยง Package ' + ref.package +
+    (ref.note ? ' · ' + ref.note : '') + ' +' + fmt2(amount) + suffix;
+}
+
+function monthReferrals(ym, data) {
+  var out = [];
+  (data.referrals || []).forEach(function (r) {
+    if (r.status === 'deleted') return;
+    var dm = r.date.slice(0, 7);
+    var pp = r.confirmed === true ? referralPayPeriod(r, data) : '';
+    var pendingFrom = '';
+    var include = false;
+    if (dm === ym) include = true;
+    else if (r.confirmed !== true && dm < ym) { include = true; pendingFrom = dm; }
+    else if (r.confirmed === true && dm < ym && pp === ym) include = true;
+    if (!include) return;
+    var amount = null;
+    try { amount = referralAmount(r, data); } catch (e) { amount = null; }
+    var p = personById(r.person_id, data);
+    out.push({
+      ref_id: r.ref_id, date: r.date, person_id: r.person_id, nick: p ? p.nick : r.person_id,
+      package: r.package, note: r.note || '', amount: amount,
+      confirmed: r.confirmed === true, confirmed_by: r.confirmed_by || '', confirmed_at: r.confirmed_at || '',
+      pay_period: r.pay_period || '', pendingFrom: pendingFrom,
+      carriedInto: (r.confirmed === true && pp && pp !== dm) ? pp : ''
+    });
+  });
+  out.sort(function (a, b) {
+    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+    return a.ref_id < b.ref_id ? -1 : (a.ref_id > b.ref_id ? 1 : 0);
+  });
+  return out;
+}
+
 function monthPayout(ym, data) {
   var peopleMap = {};
   var tempsMap = {};
@@ -923,6 +977,21 @@ function monthPayout(ym, data) {
       else if (line.amount < 0) entry.minus = round2(entry.minus - line.amount);
       entry.lines.push(line.label);
     });
+  });
+
+  // P13: confirmed company-party referral fees (bucket slip -> CSV other_earn).
+  (data.referrals || []).forEach(function (ref) {
+    if (ref.status === 'deleted' || ref.confirmed !== true) return;
+    if (referralPayPeriod(ref, data) !== ym) return;
+    var amount = referralAmount(ref, data);
+    if (ref.date.slice(0, 7) !== ym) carried++;
+    if (!peopleMap[ref.person_id]) {
+      var rp = personById(ref.person_id, data);
+      peopleMap[ref.person_id] = { id: ref.person_id, nick: rp ? rp.nick : ref.person_id, plus: 0, minus: 0, lines: [] };
+    }
+    var rentry = peopleMap[ref.person_id];
+    rentry.plus = round2(rentry.plus + amount);
+    rentry.lines.push(referralLabel_(ref, amount, ym));
   });
 
   var people = Object.keys(peopleMap).map(function (k) { return peopleMap[k]; });
@@ -1123,6 +1192,11 @@ if (typeof module !== 'undefined') {
     dayAlerts: dayAlerts,
     monthAlerts: monthAlerts,
     datesOfMonth: datesOfMonth,
+    REFERRAL_PACKAGES: REFERRAL_PACKAGES,
+    referralKind: referralKind,
+    referralAmount: referralAmount,
+    referralPayPeriod: referralPayPeriod,
+    monthReferrals: monthReferrals,
     ABSENT_KINDS: ABSENT_KINDS
   };
 }

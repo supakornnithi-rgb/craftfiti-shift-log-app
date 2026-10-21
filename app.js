@@ -398,8 +398,8 @@
       case 'calendar': return renderCalendar(r.params);
       case 'record': return renderRecord(r.params);
       case 'stats': return renderStats(r.params);
-      case 'payout': return renderPayout(r.params);
-      case 'settings': return renderSettings(r.params);
+      case 'payout': referralState.form = null; return renderPayout(r.params);
+      case 'settings': settingsState.ratesUnlocked = false; return renderSettings(r.params);
       default: return renderCalendar({});
     }
   }
@@ -1528,6 +1528,112 @@
       '<div class="card-plain" style="padding:10px 14px">' + html + '</div>';
   }
 
+  // ---------- P13: company-party referral fee (list on the payout page) ----------
+  var referralState = { form: null }; // form: { ref_id, date, person_id, package, note } while the inline form is open
+
+  function referralPriceOn(pkg, date) {
+    try { return window.referralAmount({ package: pkg, date: date }, state.bundle); } catch (e) { return null; }
+  }
+
+  function referralFormHtml() {
+    var f = referralState.form;
+    var people = (state.bundle.people || []).filter(function (p) { return p.active !== false && (p.group === 'director' || p.group === 'staff'); });
+    var opts = '<option value="">— เลือกผู้แนะนำ —</option>' + people.map(function (p) {
+      return '<option value="' + esc(p.id) + '"' + (f.person_id === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>';
+    }).join('');
+    var pkgBtns = window.REFERRAL_PACKAGES.map(function (k) {
+      var price = f.date ? referralPriceOn(k, f.date) : null;
+      return '<button type="button" class="opt' + (f.package === k ? ' opt-on' : '') + '" data-act="setRefPkg" data-pkg="' + k + '">' +
+        k + ' · ' + (price != null ? Number(price).toLocaleString('en-US') : '–') + '</button>';
+    }).join('');
+    return '<div style="padding:10px 14px;border-top:1px solid #F0EAE0;background:#FBF8F2">' +
+      '<div style="font-size:13px;font-weight:600">' + (f.ref_id ? 'แก้ไขรายการ' : 'เพิ่มรายการ') + '</div>' +
+      '<div class="form-row"><label for="refDate">วันที่จัดงาน</label><input id="refDate" type="date" data-onchange="setRefDate" value="' + esc(f.date) + '"></div>' +
+      '<div class="form-row"><label for="refPerson">ผู้แนะนำ</label><select id="refPerson" data-onchange="setRefPerson">' + opts + '</select></div>' +
+      '<div class="form-row"><label>Package</label><div class="opt-row">' + pkgBtns + '</div></div>' +
+      '<div class="form-row"><label for="refNote">หมายเหตุ</label><input id="refNote" type="text" maxlength="100" placeholder="ชื่อบริษัท / งาน" data-oninput="setRefNote" value="' + esc(f.note) + '"></div>' +
+      '<div style="display:flex;gap:8px;margin-top:12px"><button type="button" class="btn-primary" data-act="saveRef">บันทึก</button>' +
+      '<button type="button" class="btn-outline" data-act="cancelRef">ยกเลิก</button></div></div>';
+  }
+
+  function referralSectionHtml(ym) {
+    var isOwner = state.role === 'owner';
+    var list = window.monthReferrals(ym, state.bundle);
+    var confirmedSum = 0;
+    var rows = list.map(function (r) {
+      if (r.confirmed && r.amount != null && (r.carriedInto || r.date.slice(0, 7)) === ym) confirmedSum += r.amount;
+      var ctl;
+      if (isOwner) {
+        ctl = '<label class="checkbox-row" style="margin:0"><input type="checkbox" data-onchange="toggleReferral" data-id="' + esc(r.ref_id) + '" ' + (r.confirmed ? 'checked' : '') + '>ลูกค้ามาจริง</label>';
+      } else {
+        ctl = r.confirmed
+          ? '<span class="pill p-sub">ยืนยันแล้ว ✓ ' + esc(r.confirmed_by) + ' ' + esc(ddmm(r.confirmed_at)) + '</span>'
+          : '<span class="pill p-base">รอยืนยัน</span>';
+      }
+      var del = r.confirmed ? '' : '<button type="button" class="btn-outline" style="height:32px;padding:0 10px;margin-left:6px" data-act="delRef" data-id="' + esc(r.ref_id) + '">✕</button>';
+      var notes = '';
+      if (r.pendingFrom) notes += '<div style="font-size:11px;color:#9A4F0E">ค้างยืนยันจาก ' + esc(window.monthShortYear(r.pendingFrom)) + '</div>';
+      if (r.carriedInto) notes += '<div style="font-size:11px;color:#6B6257">นับเข้างวด ' + esc(window.monthShortYear(r.carriedInto)) + '</div>';
+      return '<div style="padding:10px 14px;border-top:1px solid #F0EAE0">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+        '<button type="button" class="row-btn" style="padding:0;border:0;background:none;text-align:left;flex:1;min-width:0" data-act="' + (r.confirmed ? 'noop' : 'editRef') + '" data-id="' + esc(r.ref_id) + '">' +
+        '<div style="font-size:14px;font-weight:600">' + esc(ddmm(r.date)) + ' · ' + esc(r.nick) + ' · Package ' + esc(r.package) + ' ' + (r.amount != null ? money2(r.amount) : '–') + '</div>' +
+        (r.note ? '<div style="font-size:12px;color:#6B6257;margin-top:2px">' + esc(r.note) + '</div>' : '') + notes + '</button>' +
+        '<div style="display:flex;align-items:center">' + ctl + del + '</div></div></div>';
+    }).join('');
+    if (!list.length) rows = '<div style="padding:12px 14px;border-top:1px solid #F0EAE0;font-size:13px;color:#6B6257">ยังไม่มีรายการ — กด + เพิ่มรายการ เพื่อจดไว้กันลืม</div>';
+    return '<div style="margin:16px 2px 8px;font-size:12px;font-weight:600;color:#6B6257">ค่าแนะนำงานเลี้ยงบริษัท</div>' +
+      '<div class="card-plain" style="overflow:hidden">' + rows +
+      (referralState.form ? referralFormHtml() : '<button type="button" class="row-btn" data-act="addRef" style="color:#9A4F0E;justify-content:center;font-weight:600">+ เพิ่มรายการ</button>') +
+      '<div style="padding:10px 14px;background:#F8F4EC;border-top:1px solid #F0EAE0">' +
+      '<div style="display:flex;justify-content:space-between;font-size:13px"><span>ยืนยันแล้วงวดนี้</span><span style="font-weight:600">' + money2(confirmedSum) + '</span></div>' +
+      '<div style="font-size:11px;color:#6B6257;margin-top:2px">รวมอยู่ใน "รายได้อื่นๆ" ของไฟล์ export</div></div>' +
+      '</div>';
+  }
+
+  function bindReferralActions() {
+    var redraw = function () { renderPayout(); };
+    actions.noop = function () {};
+    actions.addRef = function () {
+      var d = state.today;
+      referralState.form = { ref_id: '', date: d.slice(0, 7) === state.ym ? d : state.ym + '-01', person_id: '', package: '', note: '' };
+      redraw();
+    };
+    actions.editRef = function (el) {
+      var r = window.monthReferrals(state.ym, state.bundle).filter(function (x) { return x.ref_id === el.getAttribute('data-id'); })[0];
+      if (!r || r.confirmed) return;
+      referralState.form = { ref_id: r.ref_id, date: r.date, person_id: r.person_id, package: r.package, note: r.note };
+      redraw();
+    };
+    actions.cancelRef = function () { referralState.form = null; redraw(); };
+    actions.setRefDate = function (el) { referralState.form.date = el.value; redraw(); };
+    actions.setRefPerson = function (el) { referralState.form.person_id = el.value; };
+    actions.setRefNote = function (el) { referralState.form.note = el.value; };
+    actions.setRefPkg = function (el) { referralState.form.package = el.getAttribute('data-pkg'); redraw(); };
+    actions.saveRef = function (el) {
+      var f = referralState.form;
+      if (!f.date || !f.person_id || !f.package) { toast('กรุณาเลือกวันที่ ผู้แนะนำ และ Package'); return; }
+      withSavingButton(el, function () {
+        return write('saveReferral', { ref_id: f.ref_id || undefined, date: f.date, person_id: f.person_id, package: f.package, note: f.note || '' }).then(function () {
+          referralState.form = null;
+          toast('บันทึกแล้ว');
+          redraw();
+        });
+      });
+    };
+    actions.delRef = function (el) {
+      if (!window.confirm('ลบรายการนี้ใช่หรือไม่')) return;
+      write('deleteReferral', { ref_id: el.getAttribute('data-id') }).then(function () { toast('ลบแล้ว'); redraw(); }).catch(function () {});
+    };
+    actions.toggleReferral = function (el) {
+      var box = el;
+      var want = !!box.checked;
+      write('confirmReferral', { ref_id: box.getAttribute('data-id'), confirmed: want }).then(function () {
+        redraw();
+      }).catch(function () { box.checked = !want; });
+    };
+  }
+
   function drawPayout(payout) {
     var ym = state.ym;
     var peopleHtml = payout.people.map(function (p) {
@@ -1598,19 +1704,21 @@
       '<div style="display:flex;justify-content:space-between;font-size:15px;color:#9B1C12;margin-top:2px"><span>ค้างจ่าย</span><span style="font-weight:600">' + money2(payout.tempUnpaidTotal) + '</span></div></div>' +
       '</div>' +
       '</div>' +
+      referralSectionHtml(ym) +
       posBonusCardHtml(payout) +
       '<div class="export-card">' +
       '<div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:15px;font-weight:600">Export ไประบบเงินเดือน</div><div style="font-size:12px;color:#CFC5B5;margin-top:2px">' + esc(payout.filename) + ' · ' + (payout.csv.split(String.fromCharCode(10)).length - 1) + ' คน · จับคู่ด้วยรหัสพนักงาน</div></div></div>' +
       '<div class="csv-pre">' + esc(payout.csv) + '</div>' +
       '<button type="button" class="btn-secondary" style="background:#F4EFE6;color:#1F1A14;margin-top:10px" data-act="downloadCsv">ดาวน์โหลด CSV</button>' +
-      '<div style="font-size:11px;color:#CFC5B5;margin-top:8px;line-height:1.6">ไปที่ Payroll Dashboard → "นำเข้า Shift Log" → เลือกไฟล์นี้ ระบบจะเติมช่อง รายได้อื่นๆ และ ขาดงาน' + (/position_pay/.test(payout.csv) ? ' และ ค่าตำแหน่ง' : '') + ' ให้อัตโนมัติเมื่อเลือกพนักงาน</div>' +
+      '<div style="font-size:11px;color:#CFC5B5;margin-top:8px;line-height:1.6">ไปที่ Payroll Dashboard → "นำเข้า Shift Log" → เลือกไฟล์นี้ ระบบจะเติมช่อง รายได้อื่นๆ (รวมค่าแนะนำงานเลี้ยงที่ยืนยันแล้ว) และ ขาดงาน' + (/position_pay/.test(payout.csv) ? ' และ ค่าตำแหน่ง' : '') + ' ให้อัตโนมัติเมื่อเลือกพนักงาน</div>' +
       '</div>' +
       '</main>' +
       navHtml('payout') +
       '</div>';
 
-    actions.prevMonth = function () { shiftMonth(-1); };
-    actions.nextMonth = function () { shiftMonth(1); };
+    actions.prevMonth = function () { referralState.form = null; shiftMonth(-1); };
+    actions.nextMonth = function () { referralState.form = null; shiftMonth(1); };
+    bindReferralActions();
     actions.copyAcct = function (el) {
       copyText(el.getAttribute('data-acct') || '', function () { toast('คัดลอกแล้ว'); });
     };
@@ -1634,7 +1742,7 @@
 
   // ================= SETTINGS =================
   var settingsState = {
-    data: null, modal: '',
+    data: null, modal: '', ratesUnlocked: false,
     addRate: { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' },
     personForm: null, personIsNew: false,
     tplDraft: null, tplViewEff: '', pwWhich: 'staff', pw1: '', pw2: ''
@@ -1739,9 +1847,13 @@
 
   var WD_CHIP_LABEL = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
   function rateFormHtml(d) {
+    if (!settingsState.ratesUnlocked) {
+      return '<div style="font-size:14px;color:#6B6257;padding:4px 0">🔒 เรทถูกล็อกไว้กันกดพลาด</div>' +
+        '<button type="button" class="btn-outline" style="margin-top:10px" data-act="unlockRates">ปลดล็อกแก้ไขเรท</button>';
+    }
     var f = settingsState.addRate;
-    var kindLabel = { absent_director: 'หักขาด กรรมการ', absent_staff: 'หักขาด พนักงาน', adhoc: 'AdHoc', temp_default: 'ค่าแรงคนนอกเริ่มต้น', normal: 'เรทปกติ (รายคน)', temp: 'ค่าแรงคนนอก (รายคน)' };
-    var kindOpts = ['absent_director', 'absent_staff', 'adhoc', 'temp_default', 'normal', 'temp'].map(function (k) {
+    var kindLabel = { absent_director: 'หักขาด กรรมการ', absent_staff: 'หักขาด พนักงาน', adhoc: 'AdHoc', temp_default: 'ค่าแรงคนนอกเริ่มต้น', normal: 'เรทปกติ (รายคน)', temp: 'ค่าแรงคนนอก (รายคน)', referral_A: 'ค่าแนะนำงานเลี้ยง Package A', referral_B: 'ค่าแนะนำงานเลี้ยง Package B', referral_C: 'ค่าแนะนำงานเลี้ยง Package C' };
+    var kindOpts = ['absent_director', 'absent_staff', 'adhoc', 'temp_default', 'normal', 'temp', 'referral_A', 'referral_B', 'referral_C'].map(function (k) {
       return '<option value="' + k + '"' + (f.kind === k ? ' selected' : '') + '>' + kindLabel[k] + '</option>';
     }).join('');
     var personRow = '';
@@ -1837,6 +1949,11 @@
       var label = { absent_director: 'หักขาด กรรมการ', absent_staff: 'หักขาด พนักงาน', adhoc: 'AdHoc', temp_default: 'ค่าแรงคนนอกเริ่มต้น' }[k];
       return '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-top:1px solid #F0EAE0"><span style="font-size:14px">' + label + '</span><span style="font-size:14px;font-weight:600">' + (todayRates[k] != null ? todayRates[k] : '–') + '</span></div>';
     }).join('');
+    var refPrices = ['A', 'B', 'C'].map(function (k) {
+      var r = rateEffective(d.rates, 'referral_' + k, '');
+      return k + ' ' + (r ? r.amount : '–');
+    }).join(' · ');
+    rateHistory += '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-top:1px solid #F0EAE0"><span style="font-size:14px">ค่าแนะนำงานเลี้ยง</span><span style="font-size:14px;font-weight:600">' + refPrices + '</span></div>';
     var rateSection =
       '<div class="sec">เรทกลาง</div><div class="card-plain">' + rateHistory + '</div>' +
       '<div class="sec">เพิ่มเรทใหม่</div><div class="card">' + rateFormHtml(d) + '</div>';
@@ -1930,6 +2047,11 @@
         renderSettings();
       }); });
     };
+    actions.unlockRates = function () {
+      if (!window.confirm('ปลดล็อกเพื่อเพิ่ม/แก้เรท?\nเรทใหม่มีผลกับเงินทุกคนตั้งแต่วันที่เลือก')) return;
+      settingsState.ratesUnlocked = true;
+      drawSettingsOwner();
+    };
     actions.setRateKind = function (el) { settingsState.addRate.kind = el.value; settingsState.addRate.person_id = ''; drawSettingsOwner(); };
     actions.setRatePerson = function (el) { settingsState.addRate.person_id = el.value; };
     actions.setRateAmt = function (el) { settingsState.addRate.amount = el.value; };
@@ -1951,6 +2073,7 @@
         weekdays: (f.weekdays || []).join(','), replaces: f.replaces || ''
       }).then(function () {
         toast('เพิ่มเรทแล้ว');
+        settingsState.ratesUnlocked = false;
         settingsState.addRate = { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' };
         renderSettings();
       }); });
