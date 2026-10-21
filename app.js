@@ -1694,6 +1694,7 @@
       if (r.kind !== kind) return false;
       if (r.effective_from > today) return false;
       if ((kind === 'normal' || kind === 'temp') && r.person_id !== personId) return false;
+      if (ABSENT_KINDS[kind] && personId === '' && r.person_id) return false;
       return true;
     });
     if (!candidates.length) return null;
@@ -1748,6 +1749,11 @@
       var list = f.kind === 'normal' ? d.people.filter(function (p) { return p.group === 'staff'; }) : d.people.filter(function (p) { return p.group === 'temp'; });
       var opts = '<option value="">— เลือกคน —</option>' + list.map(function (p) { return '<option value="' + p.id + '"' + (f.person_id === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
       personRow = '<div class="form-row"><label for="ratePerson">คน</label><select id="ratePerson" data-onchange="setRatePerson">' + opts + '</select></div>';
+    } else if (ABSENT_KINDS[f.kind]) {
+      var grp = f.kind === 'absent_director' ? 'director' : 'staff';
+      var list = d.people.filter(function (p) { return p.active && p.group === grp; });
+      var opts = '<option value="">— ทุกคนในกลุ่ม —</option>' + list.map(function (p) { return '<option value="' + p.id + '"' + (f.person_id === p.id ? ' selected' : '') + '>' + esc(p.nick) + '</option>'; }).join('');
+      personRow = '<div class="form-row"><label for="ratePerson">คน (ไม่บังคับ — ว่าง = ใช้กับทุกคนในกลุ่ม)</label><select id="ratePerson" data-onchange="setRatePerson">' + opts + '</select></div>';
     }
     var conditionRow = '';
     if (f.kind === 'normal') {
@@ -1788,6 +1794,7 @@
       todayRates[k] = r ? r.amount : null;
     });
     var groupLabel = { director: 'กรรมการ', staff: 'พนักงาน', temp: 'คนนอก' };
+    var hasCustomAbsent = false;
     var peopleRows = ['director', 'staff', 'temp'].map(function (g) {
       return d.people.filter(function (p) { return p.group === g; }).map(function (p) {
         var variants = g === 'staff' ? activeNormalVariants(d.rates, p.id) : [];
@@ -1795,7 +1802,19 @@
         var rateTxt = g === 'director' ? '–' : (g === 'staff'
           ? (variants.length ? variants.map(function (v) { return v.amount + rateConditionLabel(v); }).join(' / ') : '–')
           : (tempRate ? String(tempRate.amount) : '–'));
-        var dedTxt = g === 'temp' ? '–' : (g === 'director' ? (todayRates.absent_director == null ? '–' : todayRates.absent_director) : (todayRates.absent_staff == null ? '–' : todayRates.absent_staff));
+        var dedTxt = '–';
+        if (g === 'director' || g === 'staff') {
+          try {
+            var amt = rateOn(absentRateKind(p.group), p.id, state.today, d.rates);
+            var isCustom = (d.rates || []).some(function (r) {
+              return r.kind === absentRateKind(p.group) && r.person_id === p.id && r.effective_from <= state.today;
+            });
+            if (isCustom) hasCustomAbsent = true;
+            dedTxt = amt + (isCustom ? ' *' : '');
+          } catch (err) {
+            dedTxt = '–';
+          }
+        }
         return '<button type="button" class="row-btn" data-act="editPerson" data-id="' + esc(p.id) + '" style="display:grid;grid-template-columns:minmax(0,1fr) 70px 96px 64px;align-items:center">' +
           '<span style="font-size:14px;font-weight:500;text-align:left">' + esc(p.nick) + ' <span style="font-size:11px;color:#7A7064">' + esc(p.id) + (p.active ? '' : ' · ปิดใช้งาน') + '</span></span>' +
           '<span><span class="g g-' + (g === 'director' ? 'D' : g === 'staff' ? 'S' : 'T') + '">' + groupLabel[g] + '</span></span>' +
@@ -1811,7 +1830,8 @@
       '<div style="display:grid;grid-template-columns:minmax(0,1fr) 70px 64px 64px;padding:8px 14px;font-size:11px;font-weight:600;color:#6B6257;background:#F8F4EC"><span>ชื่อ</span><span>กลุ่ม</span><span style="text-align:right">เรทปกติ</span><span style="text-align:right">หักเมื่อขาด</span></div>' +
       peopleRows +
       '<button type="button" class="row-btn" data-act="newPerson" style="color:#9A4F0E;justify-content:center;font-weight:600">+ เพิ่มคน</button>' +
-      '</div>';
+      '</div>' +
+      (hasCustomAbsent ? '<div style="margin:6px 4px 0;font-size:11px;color:#7A7064">* = เรทหักขาดเฉพาะคน</div>' : '');
 
     var rateHistory = ['absent_director', 'absent_staff', 'adhoc', 'temp_default'].map(function (k) {
       var label = { absent_director: 'หักขาด กรรมการ', absent_staff: 'หักขาด พนักงาน', adhoc: 'AdHoc', temp_default: 'ค่าแรงคนนอกเริ่มต้น' }[k];

@@ -135,11 +135,13 @@ function nickOf(id, data) {
 // ---------- rates ----------
 
 var PERSON_SCOPED_KINDS = { normal: true, temp: true };
+var ABSENT_KINDS = { absent_director: true, absent_staff: true };
 
 function rateRowScore_(r) {
   var s = 0;
   if (r.replaces) s += 2;
   if (r.weekdays) s += 1;
+  if (ABSENT_KINDS[r.kind] && r.person_id) s += 4;
   return s;
 }
 
@@ -152,6 +154,7 @@ function rateOn(kind, personId, date, rates, opts) {
     if (r.kind !== kind) return false;
     if (r.effective_from > date) return false;
     if (PERSON_SCOPED_KINDS[kind] && r.person_id !== personId) return false;
+    if (ABSENT_KINDS[kind] && r.person_id && r.person_id !== personId) return false;
     if (r.weekdays) {
       var wds = String(r.weekdays).split(',').map(function (s) { return s.trim(); }).filter(Boolean);
       if (wds.indexOf(String(wd)) === -1) return false;
@@ -1119,6 +1122,7 @@ if (typeof module !== 'undefined') {
     coverOf: coverOf,
     dayAlerts: dayAlerts,
     monthAlerts: monthAlerts,
-    datesOfMonth: datesOfMonth
+    datesOfMonth: datesOfMonth,
+    ABSENT_KINDS: ABSENT_KINDS
   };
 }
