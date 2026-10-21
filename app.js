@@ -645,13 +645,18 @@
 
     // P7 §4.3.1: button above the grid to open the monthly Tuesday planner, with a badge when
     // any Tuesday of the displayed month is still unassigned.
+    // P14: day.tueSlot exists only on Tuesdays whose effective template has a tue_slot row, so the
+    // button is hidden entirely for a month without any (e.g. after the fixed-Tuesday template).
+    var hasTueSlotMonth = month.days.some(function (day) { return !!day.tueSlot; });
     var unassignedTueCount = month.days.filter(function (day) {
       return weekdayOf(day.date) === 2 && day.tueSlot && !day.tueSlot.person_id;
     }).length;
-    var tuePlannerBtnHtml = '<button type="button" class="btn-outline" style="margin-bottom:10px;width:100%;display:flex;justify-content:center;align-items:center;gap:8px" data-act="openTuePlanner">' +
-      'จัดช่องอังคาร ' + esc(ymLabel(ym)) +
-      (unassignedTueCount > 0 ? ' <span class="pill" style="background:#FBE1DC;color:#9B1C12">ยังไม่จัด ' + unassignedTueCount + '</span>' : '') +
-      '</button>';
+    var tuePlannerBtnHtml = hasTueSlotMonth
+      ? '<button type="button" class="btn-outline" style="margin-bottom:10px;width:100%;display:flex;justify-content:center;align-items:center;gap:8px" data-act="openTuePlanner">' +
+        'จัดช่องอังคาร ' + esc(ymLabel(ym)) +
+        (unassignedTueCount > 0 ? ' <span class="pill" style="background:#FBE1DC;color:#9B1C12">ยังไม่จัด ' + unassignedTueCount + '</span>' : '') +
+        '</button>'
+      : '';
 
     var alertBtnHtml = alertCount > 0
       ? '<button type="button" class="alert-btn" data-act="openAlerts">⚠️ ต้องจัดการ ' + alertCount + '</button>'
@@ -793,6 +798,9 @@
         var p = d.person_id ? personById(d.person_id) : null;
         return '<div class="detail-row"><span>' + esc(tueDateLabel(d.date)) + '</span><span>' + esc(p ? p.nick : 'ยังไม่จัด') + '</span></div>';
       }).join('');
+    } else if (!plan.days.length) {
+      // P14: no Tuesday of this month has a tue_slot in its effective template.
+      bodyHtml = '<div style="padding:24px 0;text-align:center;color:#7A7064;font-size:13px">เดือนนี้แม่แบบเวรไม่มีช่องอังคาร</div>';
     } else {
       bodyHtml = plan.days.map(function (d) {
         var choice = tuePlanState.choices[d.date];
@@ -814,7 +822,7 @@
           '</div>';
       }).join('');
     }
-    var footer = (plan && !plan.closed) ? '<button type="button" class="btn-primary" style="margin-top:14px;width:100%" data-act="saveTuePlan">บันทึกทั้งเดือน</button>' : '';
+    var footer = (plan && !plan.closed && plan.days.length) ? '<button type="button" class="btn-primary" style="margin-top:14px;width:100%" data-act="saveTuePlan">บันทึกทั้งเดือน</button>' : '';
     return '<div class="modal-backdrop" data-act="closeTuePlanner">' +
       '<div class="modal-sheet" data-act="stop" style="position:relative">' +
       '<button type="button" class="day-modal-close" data-act="closeTuePlanner" aria-label="ปิด">✕</button>' +
@@ -921,9 +929,10 @@
 
     // P7 §4.3.3: on Tuesdays the popup shows a read-only line for the slot (money comes straight
     // from the API's monthView `tueSlot` field) plus a link that opens the monthly planner.
+    // P14: only when day.tueSlot exists, i.e. the effective template has a tue_slot for that Tuesday.
     var tueHtml = '';
-    if (wd === 2) {
-      var slotInfo = day.tueSlot || { person_id: '', money: [] };
+    if (day.tueSlot) {
+      var slotInfo = day.tueSlot;
       var slotLine = slotInfo.person_id
         ? (esc(nickOf(slotInfo.person_id)) + (slotInfo.money.length ? ' · ' + esc(slotInfo.money[0].label) : ''))
         : 'ยังไม่จัด';
@@ -1557,23 +1566,16 @@
   }
 
   function referralSectionHtml(ym) {
-    var isOwner = state.role === 'owner';
     var list = window.monthReferrals(ym, state.bundle);
     var confirmedSum = 0;
     var rows = list.map(function (r) {
       if (r.confirmed && r.amount != null && (r.carriedInto || r.date.slice(0, 7)) === ym) confirmedSum += r.amount;
-      var ctl;
-      if (isOwner) {
-        ctl = '<label class="checkbox-row" style="margin:0"><input type="checkbox" data-onchange="toggleReferral" data-id="' + esc(r.ref_id) + '" ' + (r.confirmed ? 'checked' : '') + '>ลูกค้ามาจริง</label>';
-      } else {
-        ctl = r.confirmed
-          ? '<span class="pill p-sub">ยืนยันแล้ว ✓ ' + esc(r.confirmed_by) + ' ' + esc(ddmm(r.confirmed_at)) + '</span>'
-          : '<span class="pill p-base">รอยืนยัน</span>';
-      }
+      var ctl = '<label class="checkbox-row" style="margin:0"><input type="checkbox" data-onchange="toggleReferral" data-id="' + esc(r.ref_id) + '" ' + (r.confirmed ? 'checked' : '') + '>ลูกค้ามาจริง</label>';
       var del = r.confirmed ? '' : '<button type="button" class="btn-outline" style="height:32px;padding:0 10px;margin-left:6px" data-act="delRef" data-id="' + esc(r.ref_id) + '">✕</button>';
       var notes = '';
       if (r.pendingFrom) notes += '<div style="font-size:11px;color:#9A4F0E">ค้างยืนยันจาก ' + esc(window.monthShortYear(r.pendingFrom)) + '</div>';
       if (r.carriedInto) notes += '<div style="font-size:11px;color:#6B6257">นับเข้างวด ' + esc(window.monthShortYear(r.carriedInto)) + '</div>';
+      if (r.confirmed) notes += '<div style="font-size:11px;color:#17613B">ยืนยันโดย ' + esc(r.confirmed_by) + ' ' + esc(ddmm(r.confirmed_at)) + '</div>';
       return '<div style="padding:10px 14px;border-top:1px solid #F0EAE0">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
         '<button type="button" class="row-btn" style="padding:0;border:0;background:none;text-align:left;flex:1;min-width:0" data-act="' + (r.confirmed ? 'noop' : 'editRef') + '" data-id="' + esc(r.ref_id) + '">' +
@@ -1830,6 +1832,14 @@
     if (!candidates.length) return [];
     var latestEff = candidates.reduce(function (a, b) { return b.effective_from > a ? b.effective_from : a; }, candidates[0].effective_from);
     return candidates.filter(function (t) { return t.effective_from === latestEff; }).sort(function (a, b) { return a.slot_order - b.slot_order; });
+  }
+
+  // P14: rows of the set with the greatest effective_from overall (a future set counts), by slot_order.
+  function templateLatestRows(templates) {
+    var all = templates || [];
+    if (!all.length) return [];
+    var latestEff = all.reduce(function (a, b) { return b.effective_from > a ? b.effective_from : a; }, all[0].effective_from);
+    return all.filter(function (t) { return t.effective_from === latestEff; }).sort(function (a, b) { return a.slot_order - b.slot_order; });
   }
 
   function tplWeekdayChips(rows, weekday) {
@@ -2133,17 +2143,19 @@
       var row = settingsState.tplDraft.rows.find(function (r) { return r.weekday === wd && r.kind === 'alt'; });
       if (row) row.alt_anchor = el.value;
     };
-    actions.saveTemplateForm = function () {
+    actions.saveTemplateForm = function (el) {
       var draft = settingsState.tplDraft;
       if (!draft.effective_from) { toast('กรุณาเลือกวันมีผล'); return; }
-      write('saveTemplate', {
+      // P14: a set with this effective_from already exists -> saving would merge two sets into one roster.
+      if (window.templateSetExists(draft.effective_from, d.templates)) { toast('มีแม่แบบที่มีผลวันที่ ' + draft.effective_from + ' อยู่แล้ว — เลือกวันอื่น หรือลบชุดเดิมก่อน'); return; }
+      withSavingButton(el, function () { return write('saveTemplate', {
         effective_from: draft.effective_from,
         rows: draft.rows.map(function (r, idx) { return { weekday: r.weekday, slot_order: idx, kind: r.kind, person_id: r.person_id || '', persons: r.persons || '', alt_anchor: r.alt_anchor || '' }; })
       }).then(function () {
         toast('บันทึกแม่แบบแล้ว');
         settingsState.modal = '';
         renderSettings();
-      });
+      }); });
     };
     actions.deleteTemplateSet = function (el) {
       var eff = el.getAttribute('data-eff');
@@ -2217,14 +2229,14 @@
     return y + '-' + pad2(m) + '-01';
   }
 
-  // P5 §4.7: "สร้างแม่แบบใหม่" opens the editor prefilled from the latest set, effective_from defaulting
-  // to the first day of next month. The editor also allows editing tue_slot presence and the alt slot
-  // (persons list + anchor date) per weekday.
+  // P5 §4.7: "สร้างแม่แบบใหม่" opens the editor prefilled from the newest set (may be a future set, P14),
+  // effective_from defaulting to the first day of next month. The editor also allows editing tue_slot
+  // presence and the alt slot (persons list + anchor date) per weekday.
   function openTemplateEditor(d) {
-    var effRows = templateEffectiveRows(d.templates);
+    var latestRows = templateLatestRows(d.templates);
     settingsState.tplDraft = {
       effective_from: firstDayOfNextMonth(state.today),
-      rows: effRows.map(function (r) { return Object.assign({}, r); })
+      rows: latestRows.map(function (r) { return Object.assign({}, r); })
     };
     settingsState.modal = templateModalHtml(d);
     drawSettingsOwner();

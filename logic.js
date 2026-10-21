@@ -218,6 +218,17 @@ function baseRoster(date, data) {
   return out;
 }
 
+// P14: the Tuesday slot exists only on a Tuesday whose effective template set has a tue_slot row for Tuesday.
+function tueSlotActive(date, data) {
+  if (weekdayOf(date) !== 2) return false;
+  return templateFor(date, data.templates).some(function (r) { return r.weekday === 2 && r.kind === 'tue_slot'; });
+}
+
+// P14: true when a template set with exactly this effective_from already exists (saving it again would merge rows).
+function templateSetExists(effectiveFrom, templates) {
+  return (templates || []).some(function (t) { return t.effective_from === effectiveFrom; });
+}
+
 function eventsTouching(date, events) {
   return (events || []).filter(function (e) { return e.date === date || e.date2 === date; });
 }
@@ -387,11 +398,12 @@ function tueSlotMoney(slot, data) {
   }];
 }
 
-// P7 §4.1.4: the monthly Tuesday planner — one row per Tuesday of ym, with the pay options for
-// each allowed id (in the order given by `tueAllowed`, which the server passes already ordered).
+// P7 §4.1.4: the monthly Tuesday planner — one row per Tuesday of ym that has a slot in the
+// effective template (P14), with the pay options for each allowed id (in the order given by
+// `tueAllowed`, which the server passes already ordered).
 function tuePlan(ym, data, tueAllowed) {
   var closed = isClosedYm(ym, data.periods);
-  var dates = datesOfMonth(ym).filter(function (d) { return weekdayOf(d) === 2; });
+  var dates = datesOfMonth(ym).filter(function (d) { return tueSlotActive(d, data); });
   var days = dates.map(function (d) {
     var slot = (data.tueSlots || []).find(function (s) { return s.date === d; });
     var personId = slot ? slot.person_id : '';
@@ -962,9 +974,11 @@ function monthPayout(ym, data) {
 
   // P7 §4.1.2: Tuesday-slot pay lines for every Tuesday of ym that has a person assigned.
   // Slots cannot be set in closed months, so there is no carry-over case to handle here.
+  // P14: a slot row on a Tuesday whose effective template has no tue_slot is stale and never paid.
   (data.tueSlots || []).forEach(function (slot) {
     if (!slot.person_id) return;
     if (slot.date.slice(0, 7) !== ym) return;
+    if (!tueSlotActive(slot.date, data)) return;
     var lines = tueSlotMoney(slot, data);
     lines.forEach(function (line) {
       var p = personById(line.person_id, data);
@@ -1145,7 +1159,8 @@ function monthView(ym, data) {
     });
     var out = { date: dr.date, weekday: dr.weekday, roster: dr.roster, events: events };
     // P7 §4.1.3: Tuesday-slot pay preview, so the UI can show it without a separate call.
-    if (dr.weekday === 2) {
+    // P14: only on Tuesdays whose effective template set has a tue_slot row.
+    if (tueSlotActive(d, data)) {
       var slot = (data.tueSlots || []).find(function (s) { return s.date === d; });
       var personId = slot ? slot.person_id : '';
       out.tueSlot = { person_id: personId, money: tueSlotMoney({ date: d, person_id: personId }, data) };
@@ -1172,6 +1187,8 @@ if (typeof module !== 'undefined') {
     rateOn: rateOn,
     templateFor: templateFor,
     baseRoster: baseRoster,
+    tueSlotActive: tueSlotActive,
+    templateSetExists: templateSetExists,
     dayRoster: dayRoster,
     eventMoney: eventMoney,
     tueSlotMoney: tueSlotMoney,
