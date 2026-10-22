@@ -2035,8 +2035,8 @@
 
   function bindSettingsActions(d) {
     actions.stop = function () { /* no-op: absorbs clicks inside modal sheet */ };
-    actions.closeModal = function () { settingsState.modal = ''; drawSettingsOwner(); };
-    actions.closeModalBg = function () { settingsState.modal = ''; drawSettingsOwner(); };
+    actions.closeModal = function () { settingsState.modal = ''; settingsState.personErrors = []; drawSettingsOwner(); };
+    actions.closeModalBg = function () { settingsState.modal = ''; settingsState.personErrors = []; drawSettingsOwner(); };
     actions.editPerson = function (el) { openPersonModal(d, el.getAttribute('data-id')); };
     actions.newPerson = function () { openPersonModal(d, null); };
     actions.setPersonField = function (el) {
@@ -2044,18 +2044,67 @@
       settingsState.personForm[field] = el.value;
       if (field === 'group') { settingsState.modal = personModalHtml(); drawSettingsOwner(); }
     };
-    actions.setPersonCheck = function (el) { settingsState.personForm[el.getAttribute('data-field')] = el.checked; };
+    actions.setPersonCheck = function (el) {
+      var field = el.getAttribute('data-field');
+      settingsState.personForm[field] = el.checked;
+      if (field === 'active') {
+        settingsState.personErrors = [];
+        settingsState.modal = personModalHtml();
+        drawSettingsOwner();
+      }
+    };
     actions.savePersonForm = function (el) {
       var f = settingsState.personForm;
       if (!f.nick) { toast('กรุณาใส่ชื่อเล่น'); return; }
-      var payload = { nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
+      var isNew = !!settingsState.personIsNew;
+      var existingPerson = (!isNew && f.id)
+        ? ((state.bundle && state.bundle.people) || []).find(function (p) { return p.id === f.id; })
+        : null;
+
+      if (existingPerson && existingPerson.active !== false && !f.active) {
+        var blockers = deactivateBlockers(existingPerson, state.today, state.bundle);
+        if (blockers && blockers.length) {
+          settingsState.personErrors = blockers;
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+          return;
+        }
+      }
+
+      var payload = { isNew: isNew, nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
       if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
       if (f.id) payload.id = f.id;
-      withSavingButton(el, function () { return write('savePerson', payload).then(function () {
-        toast('บันทึกแล้ว');
-        settingsState.modal = '';
-        renderSettings();
-      }); });
+      withSavingButton(el, function () {
+        return write('savePerson', payload).then(function (res) {
+          settingsState.personErrors = [];
+          if (isNew && (f.group === 'director' || f.group === 'staff')) {
+            var newId = (res && res.id) || payload.id;
+            var latestRows = templateLatestRows(state.bundle.templates);
+            var inTemplate = latestRows.some(function (r) {
+              if (r.kind === 'fixed' && r.person_id === newId) return true;
+              if (r.kind === 'alt') {
+                var pList = (r.persons || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+                if (pList.indexOf(newId) !== -1) return true;
+              }
+              return false;
+            });
+            if (!inTemplate) {
+              settingsState.modal = personCreatedNoticeHtml(f.nick);
+              renderSettings();
+              return;
+            }
+          }
+          toast('บันทึกแล้ว');
+          settingsState.modal = '';
+          renderSettings();
+        }).catch(function (err) {
+          var msg = (err && (err.message || err.error)) || 'เกิดข้อผิดพลาด';
+          var errList = String(msg).split(' · ').filter(Boolean);
+          settingsState.personErrors = errList.length ? errList : [msg];
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+        });
+      });
     };
     actions.unlockRates = function () {
       if (!window.confirm('ปลดล็อกเพื่อเพิ่ม/แก้เรท?\nเรทใหม่มีผลกับเงินทุกคนตั้งแต่วันที่เลือก')) return;
@@ -2197,6 +2246,7 @@
       bank: existing.bank || '', account_no: existing.account_no || ''
     } : { id: '', nick: '', group: 'staff', code: '', active: true, regular: false, bank: '', account_no: '' };
     settingsState.personIsNew = !existing;
+    settingsState.personErrors = [];
     settingsState.modal = personModalHtml();
     drawSettingsOwner();
   }
@@ -2206,6 +2256,16 @@
       var label = { director: 'กรรมการ', staff: 'พนักงาน', temp: 'คนนอก' }[g];
       return '<option value="' + g + '"' + (f.group === g ? ' selected' : '') + '>' + label + '</option>';
     }).join('');
+    var isDirStaff = f.group === 'director' || f.group === 'staff';
+    var crossSystemNote = isDirStaff
+      ? '<div style="font-size:11px;color:#7A7064;margin-top:10px;line-height:1.4">เพิ่ม/ปิดใช้งานกรรมการหรือพนักงาน ต้องแก้อีก 2 ระบบด้วย: Payroll (Employee_DB) · Incentive (I_STAFF ใน Rules.js + Data validation ใน Sheet)</div>'
+      : '';
+    var errHtml = '';
+    if (settingsState.personErrors && settingsState.personErrors.length) {
+      errHtml = '<div class="error-box" style="margin-top:10px">' +
+        settingsState.personErrors.map(function (msg) { return '<div>' + esc(msg) + '</div>'; }).join('') +
+        '</div>';
+    }
     return '<div class="modal-backdrop" data-act="closeModalBg"><div class="modal-sheet" data-act="stop">' +
       '<div style="font-size:16px;font-weight:600">' + (settingsState.personIsNew ? 'เพิ่มคน' : 'แก้ไข ' + esc(f.nick)) + '</div>' +
       (settingsState.personIsNew ? '<div class="form-row"><label for="pId">รหัส (4 หลัก ถ้าเป็นกรรมการ/พนักงาน)</label><input id="pId" data-oninput="setPersonField" data-field="id" value="' + esc(f.id) + '"></div>' : '') +
@@ -2218,8 +2278,21 @@
         : '') +
       '<label class="checkbox-row"><input type="checkbox" data-onchange="setPersonCheck" data-field="active" ' + (f.active ? 'checked' : '') + '>ใช้งานอยู่</label>' +
       '<label class="checkbox-row"><input type="checkbox" data-onchange="setPersonCheck" data-field="regular" ' + (f.regular ? 'checked' : '') + '>คนประจำ (ขึ้นในตัวเลือกด่วน)</label>' +
+      crossSystemNote +
+      errHtml +
       '<button type="button" class="btn-primary" style="margin-top:14px" data-act="savePersonForm">บันทึก</button>' +
       '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="closeModal">ยกเลิก</button>' +
+      '</div></div>';
+  }
+
+  function personCreatedNoticeHtml(nick) {
+    return '<div class="modal-backdrop" data-act="closeModalBg"><div class="modal-sheet" data-act="stop">' +
+      '<div style="font-size:16px;font-weight:600">เพิ่ม ' + esc(nick) + ' แล้ว</div>' +
+      '<div style="margin-top:12px;font-size:14px;color:#1F1A14;line-height:1.5">' +
+      'เพิ่ม ' + esc(nick) + ' แล้ว — ยังไม่มีวันทำงานประจำ ไปที่ "แม่แบบเวร" สร้างชุดใหม่ที่มีชื่อนี้' +
+      '</div>' +
+      '<button type="button" class="btn-primary" style="margin-top:16px" data-act="openTplEditor">ไปที่แม่แบบเวร</button>' +
+      '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="closeModal">ปิด</button>' +
       '</div></div>';
   }
 

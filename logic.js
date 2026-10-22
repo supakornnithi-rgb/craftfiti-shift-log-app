@@ -229,6 +229,108 @@ function templateSetExists(effectiveFrom, templates) {
   return (templates || []).some(function (t) { return t.effective_from === effectiveFrom; });
 }
 
+// P16: safe add / deactivate pure helpers
+function personTemplateUse(personId, today, templates) {
+  if (!personId || !templates || !templates.length) return [];
+  var currentSet = templateFor(today, templates);
+  var currentEff = currentSet.length ? currentSet[0].effective_from : null;
+
+  var setsByEff = {};
+  templates.forEach(function (r) {
+    if (!r.effective_from) return;
+    if (!setsByEff[r.effective_from]) setsByEff[r.effective_from] = [];
+    setsByEff[r.effective_from].push(r);
+  });
+
+  var effDates = Object.keys(setsByEff).sort();
+  var out = [];
+  effDates.forEach(function (eff) {
+    if (eff === currentEff || eff > today) {
+      var rows = setsByEff[eff];
+      var hasPerson = rows.some(function (r) {
+        if (r.kind === 'fixed' && r.person_id === personId) return true;
+        if (r.kind === 'alt') {
+          var list = (r.persons || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+          if (list.indexOf(personId) !== -1) return true;
+        }
+        return false;
+      });
+      if (hasPerson) {
+        out.push(eff);
+      }
+    }
+  });
+  return out;
+}
+
+function personFutureBookings(personId, today, data) {
+  if (!personId || !data) return { events: [], tueSlots: [] };
+  var events = (data.events || [])
+    .filter(function (e) {
+      if (e.status === 'deleted') return false;
+      var matchesDate = (e.date >= today) || (e.date2 && e.date2 >= today);
+      if (!matchesDate) return false;
+      return e.person_id === personId || e.person2_id === personId;
+    })
+    .map(function (e) {
+      var d = e.date >= today ? e.date : (e.date2 || e.date);
+      return { event_id: e.event_id, type: e.type, date: d };
+    })
+    .sort(function (a, b) {
+      return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0);
+    });
+
+  var tueSlots = (data.tueSlots || [])
+    .filter(function (s) {
+      return s.date >= today && s.person_id === personId && tueSlotActive(s.date, data);
+    })
+    .map(function (s) { return s.date; })
+    .sort();
+
+  return { events: events, tueSlots: tueSlots };
+}
+
+function deactivateBlockers(person, today, data) {
+  if (!person || !data) return [];
+  var nick = person.nick || person.id || '';
+  var blockers = [];
+
+  // director/staff with template use
+  if (person.group === 'director' || person.group === 'staff') {
+    var templateSets = personTemplateUse(person.id, today, data.templates);
+    if (templateSets.length > 0) {
+      blockers.push(nick + ' ยังมีวันทำงานประจำในแม่แบบเวรชุด ' + templateSets.join(', ') + ' — สร้างแม่แบบชุดใหม่ที่ไม่มี ' + nick + ' และรอให้ชุดนั้นมีผลก่อน จึงปิดใช้งานได้');
+    }
+  }
+
+  // any group with future events
+  var bookings = personFutureBookings(person.id, today, data);
+  if (bookings.events.length > 0) {
+    var uniqueDates = [];
+    bookings.events.forEach(function (e) {
+      if (uniqueDates.indexOf(e.date) === -1) uniqueDates.push(e.date);
+    });
+    var datesStr = uniqueDates.slice(0, 5).join(', ');
+    if (uniqueDates.length > 5) {
+      datesStr += ' …';
+    }
+    blockers.push(nick + ' มีรายการที่บันทึกไว้ตั้งแต่วันนี้เป็นต้นไป ' + bookings.events.length + ' รายการ (' + datesStr + ') — ลบหรือเปลี่ยนคนในรายการเหล่านั้นก่อน');
+  }
+
+  // director/staff with future Tuesday slots
+  if (person.group === 'director' || person.group === 'staff') {
+    if (bookings.tueSlots.length > 0) {
+      var uniqueTue = [];
+      bookings.tueSlots.forEach(function (d) {
+        if (uniqueTue.indexOf(d) === -1) uniqueTue.push(d);
+      });
+      blockers.push(nick + ' ถูกจัดช่องอังคารวันที่ ' + uniqueTue.join(', ') + ' — เปลี่ยนคนในตัวจัดช่องอังคารก่อน');
+    }
+  }
+
+  return blockers;
+}
+
 function eventsTouching(date, events) {
   return (events || []).filter(function (e) { return e.date === date || e.date2 === date; });
 }
@@ -1214,6 +1316,9 @@ if (typeof module !== 'undefined') {
     referralAmount: referralAmount,
     referralPayPeriod: referralPayPeriod,
     monthReferrals: monthReferrals,
-    ABSENT_KINDS: ABSENT_KINDS
+    ABSENT_KINDS: ABSENT_KINDS,
+    personTemplateUse: personTemplateUse,
+    personFutureBookings: personFutureBookings,
+    deactivateBlockers: deactivateBlockers
   };
 }
