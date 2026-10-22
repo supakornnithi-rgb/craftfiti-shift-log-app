@@ -1744,7 +1744,7 @@
 
   // ================= SETTINGS =================
   var settingsState = {
-    data: null, modal: '', ratesUnlocked: false,
+    data: null, modal: '', ratesUnlocked: false, showHidden: false,
     addRate: { kind: 'normal', person_id: '', amount: '', effective_from: '', weekdays: [], replaces: '' },
     personForm: null, personIsNew: false,
     tplDraft: null, tplViewEff: '', pwWhich: 'staff', pw1: '', pw2: ''
@@ -1917,8 +1917,13 @@
     });
     var groupLabel = { director: 'กรรมการ', staff: 'พนักงาน', temp: 'คนนอก' };
     var hasCustomAbsent = false;
+    var inactiveCount = (d.people || []).filter(function (p) { return p.active === false; }).length;
     var peopleRows = ['director', 'staff', 'temp'].map(function (g) {
-      return d.people.filter(function (p) { return p.group === g; }).map(function (p) {
+      return d.people.filter(function (p) {
+        if (p.group !== g) return false;
+        if (!settingsState.showHidden && p.active === false) return false;
+        return true;
+      }).map(function (p) {
         var variants = g === 'staff' ? activeNormalVariants(d.rates, p.id) : [];
         var tempRate = g === 'temp' ? rateEffective(d.rates, 'temp', p.id) : null;
         var rateTxt = g === 'director' ? '–' : (g === 'staff'
@@ -1951,6 +1956,9 @@
       '<div class="card-plain">' +
       '<div style="display:grid;grid-template-columns:minmax(0,1fr) 70px 64px 64px;padding:8px 14px;font-size:11px;font-weight:600;color:#6B6257;background:#F8F4EC"><span>ชื่อ</span><span>กลุ่ม</span><span style="text-align:right">เรทปกติ</span><span style="text-align:right">หักเมื่อขาด</span></div>' +
       peopleRows +
+      (inactiveCount > 0
+        ? '<button type="button" class="row-btn" data-act="toggleShowHidden" style="color:#7A7064;justify-content:center;font-size:13px">' + (settingsState.showHidden ? 'ซ่อนรายชื่อที่ปิดใช้งาน' : ('แสดงคนที่ซ่อนไว้ (' + inactiveCount + ')')) + '</button>'
+        : '') +
       '<button type="button" class="row-btn" data-act="newPerson" style="color:#9A4F0E;justify-content:center;font-weight:600">+ เพิ่มคน</button>' +
       '</div>' +
       (hasCustomAbsent ? '<div style="margin:6px 4px 0;font-size:11px;color:#7A7064">* = เรทหักขาดเฉพาะคน</div>' : '');
@@ -2037,6 +2045,73 @@
     actions.stop = function () { /* no-op: absorbs clicks inside modal sheet */ };
     actions.closeModal = function () { settingsState.modal = ''; settingsState.personErrors = []; drawSettingsOwner(); };
     actions.closeModalBg = function () { settingsState.modal = ''; settingsState.personErrors = []; drawSettingsOwner(); };
+    actions.toggleShowHidden = function () {
+      settingsState.showHidden = !settingsState.showHidden;
+      drawSettingsOwner();
+    };
+    actions.deletePersonForever = function (el) {
+      var f = settingsState.personForm;
+      if (!window.confirm('ลบ ' + f.nick + ' (' + f.id + ') ถาวร? ลบแล้วกู้คืนไม่ได้')) return;
+      withSavingButton(el, function () {
+        return write('deletePerson', { id: f.id }).then(function () {
+          toast('ลบ ' + f.nick + ' แล้ว');
+          settingsState.modal = '';
+          renderSettings();
+        }).catch(function (err) {
+          var msg = (err && (err.message || err.error)) || 'เกิดข้อผิดพลาด';
+          var errList = String(msg).split(' · ').filter(Boolean);
+          settingsState.personErrors = errList.length ? errList : [msg];
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+        });
+      });
+    };
+    actions.hidePerson = function (el) {
+      var f = settingsState.personForm;
+      var existingPerson = f.id ? ((state.bundle && state.bundle.people) || []).find(function (p) { return p.id === f.id; }) : null;
+      if (existingPerson && existingPerson.active !== false) {
+        var blockers = deactivateBlockers(existingPerson, state.today, state.bundle);
+        if (blockers && blockers.length) {
+          settingsState.personErrors = blockers;
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+          return;
+        }
+      }
+      var payload = { isNew: false, id: f.id, nick: f.nick, group: f.group, code: f.code, active: false, regular: f.regular };
+      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
+      withSavingButton(el, function () {
+        return write('savePerson', payload).then(function () {
+          toast('ซ่อน ' + f.nick + ' แล้ว');
+          settingsState.modal = '';
+          renderSettings();
+        }).catch(function (err) {
+          var msg = (err && (err.message || err.error)) || 'เกิดข้อผิดพลาด';
+          var errList = String(msg).split(' · ').filter(Boolean);
+          settingsState.personErrors = errList.length ? errList : [msg];
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+        });
+      });
+    };
+    actions.unhidePerson = function (el) {
+      var f = settingsState.personForm;
+      var payload = { isNew: false, id: f.id, nick: f.nick, group: f.group, code: f.code, active: true, regular: f.regular };
+      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
+      withSavingButton(el, function () {
+        return write('savePerson', payload).then(function () {
+          toast('แสดง ' + f.nick + ' กลับแล้ว');
+          settingsState.modal = '';
+          renderSettings();
+        }).catch(function (err) {
+          var msg = (err && (err.message || err.error)) || 'เกิดข้อผิดพลาด';
+          var errList = String(msg).split(' · ').filter(Boolean);
+          settingsState.personErrors = errList.length ? errList : [msg];
+          settingsState.modal = personModalHtml();
+          drawSettingsOwner();
+        });
+      });
+    };
     actions.editPerson = function (el) { openPersonModal(d, el.getAttribute('data-id')); };
     actions.newPerson = function () { openPersonModal(d, null); };
     actions.setPersonField = function (el) {
@@ -2252,6 +2327,24 @@
   }
   function personModalHtml() {
     var f = settingsState.personForm;
+    var actionSection = '';
+    if (!settingsState.personIsNew) {
+      var u = personUsage(f.id, state.bundle);
+      var existing = ((state.bundle && state.bundle.people) || []).find(function (p) { return p.id === f.id; });
+      var isPersonActive = existing ? existing.active !== false : f.active !== false;
+      if (u.total === 0) {
+        actionSection =
+          '<button type="button" class="btn-outline" style="margin-top:10px;width:100%;color:#9B1C12;border-color:#F2AEA3" data-act="deletePersonForever">ลบถาวร</button>' +
+          '<div style="font-size:12px;color:#7A7064;text-align:center;margin-top:6px">ยังไม่เคยมีข้อมูลในระบบ ลบได้ถาวร</div>';
+      } else if (isPersonActive) {
+        actionSection =
+          '<button type="button" class="btn-outline" style="margin-top:10px;width:100%" data-act="hidePerson">ซ่อน (ปิดใช้งาน)</button>' +
+          '<div style="font-size:12px;color:#7A7064;text-align:center;margin-top:6px;line-height:1.4">มีข้อมูลแล้ว (' + esc(personUsageText(u)) + ') — ลบถาวรไม่ได้ ซ่อนได้ ประวัติและเงินยังอยู่ครบ</div>';
+      } else {
+        actionSection =
+          '<button type="button" class="btn-outline" style="margin-top:10px;width:100%" data-act="unhidePerson">แสดงกลับ (เปิดใช้งาน)</button>';
+      }
+    }
     var groupOpts = ['director', 'staff', 'temp'].map(function (g) {
       var label = { director: 'กรรมการ', staff: 'พนักงาน', temp: 'คนนอก' }[g];
       return '<option value="' + g + '"' + (f.group === g ? ' selected' : '') + '>' + label + '</option>';
@@ -2282,6 +2375,7 @@
       errHtml +
       '<button type="button" class="btn-primary" style="margin-top:14px" data-act="savePersonForm">บันทึก</button>' +
       '<button type="button" class="btn-outline" style="margin-top:8px;width:100%" data-act="closeModal">ยกเลิก</button>' +
+      actionSection +
       '</div></div>';
   }
 

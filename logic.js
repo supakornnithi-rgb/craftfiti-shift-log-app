@@ -331,6 +331,69 @@ function deactivateBlockers(person, today, data) {
   return blockers;
 }
 
+// P17: person usage calculation for safe permanent delete
+function personUsage(personId, data) {
+  if (!personId || !data) {
+    return { events: 0, templates: 0, tueSlots: 0, referrals: 0, replaces: 0, tueAllowed: 0, total: 0 };
+  }
+
+  var events = (data.events || []).filter(function (e) {
+    if (e.status === 'deleted') return false;
+    return e.person_id === personId || e.person2_id === personId;
+  }).length;
+
+  var templates = (data.templates || []).filter(function (r) {
+    if (r.kind === 'fixed' && r.person_id === personId) return true;
+    if (r.kind === 'alt') {
+      var list = (r.persons || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      return list.indexOf(personId) !== -1;
+    }
+    return false;
+  }).length;
+
+  var tueSlots = (data.tueSlots || []).filter(function (s) {
+    return s.person_id === personId;
+  }).length;
+
+  var referrals = (data.referrals || []).filter(function (ref) {
+    if (ref.status === 'deleted') return false;
+    return ref.person_id === personId;
+  }).length;
+
+  var replaces = (data.rates || []).filter(function (rate) {
+    return rate.replaces === personId;
+  }).length;
+
+  var rawAllowed = (data.config && data.config.tue_allowed) || '';
+  var allowedList = Array.isArray(rawAllowed) ? rawAllowed : String(rawAllowed).split(',');
+  var inTueAllowed = allowedList.map(function (s) { return String(s).trim(); }).filter(Boolean).indexOf(personId) !== -1;
+  var tueAllowed = inTueAllowed ? 1 : 0;
+
+  var total = events + templates + tueSlots + referrals + replaces + tueAllowed;
+
+  return {
+    events: events,
+    templates: templates,
+    tueSlots: tueSlots,
+    referrals: referrals,
+    replaces: replaces,
+    tueAllowed: tueAllowed,
+    total: total
+  };
+}
+
+function personUsageText(usage) {
+  if (!usage) return '';
+  var parts = [];
+  if (usage.events > 0) parts.push('รายการเวร ' + usage.events);
+  if (usage.templates > 0) parts.push('แม่แบบเวร ' + usage.templates);
+  if (usage.tueSlots > 0) parts.push('ช่องอังคาร ' + usage.tueSlots);
+  if (usage.referrals > 0) parts.push('ค่าแนะนำ ' + usage.referrals);
+  if (usage.replaces > 0) parts.push('เรทที่อ้างถึง ' + usage.replaces);
+  if (usage.tueAllowed > 0) parts.push('รายชื่อช่องอังคาร');
+  return parts.join(', ');
+}
+
 function eventsTouching(date, events) {
   return (events || []).filter(function (e) { return e.date === date || e.date2 === date; });
 }
@@ -1319,6 +1382,8 @@ if (typeof module !== 'undefined') {
     ABSENT_KINDS: ABSENT_KINDS,
     personTemplateUse: personTemplateUse,
     personFutureBookings: personFutureBookings,
-    deactivateBlockers: deactivateBlockers
+    deactivateBlockers: deactivateBlockers,
+    personUsage: personUsage,
+    personUsageText: personUsageText
   };
 }
