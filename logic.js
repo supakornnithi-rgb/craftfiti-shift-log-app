@@ -1086,6 +1086,117 @@ function monthReferrals(ym, data) {
   return out;
 }
 
+// P18: rate for a staff member on a 5th-week shift (data-driven, zero hardcoded ids or nicks)
+function fifthWeekRate(personId, date, data) {
+  var p = personById(personId, data);
+  if (!p || p.group !== 'staff') return 0;
+
+  var rates = data.rates || [];
+
+  // Step 1: explicit fifth_week rate row for this person
+  var fwCandidates = rates.filter(function (r) {
+    return r.kind === 'fifth_week' && r.person_id === personId && r.effective_from <= date;
+  });
+  if (fwCandidates.length) {
+    var bestFw = fwCandidates.reduce(function (a, b) {
+      return b.effective_from > a.effective_from ? b : a;
+    });
+    return round2(bestFw.amount);
+  }
+
+  // Step 2: person-specific absent_staff rate row
+  var absCandidates = rates.filter(function (r) {
+    return r.kind === 'absent_staff' && r.person_id === personId && r.effective_from <= date;
+  });
+  if (absCandidates.length) {
+    var bestAbs = absCandidates.reduce(function (a, b) {
+      return b.effective_from > a.effective_from ? b : a;
+    });
+    return round2(bestAbs.amount);
+  }
+
+  // Step 3: Sunday fixed staff rule (gives AdHoc rate to staff who are fixed on Sunday weekday === 0 in the template effective on date)
+  var tpl = templateFor(date, data.templates);
+  var isSundayFixed = tpl.some(function (r) {
+    return r.weekday === 0 && r.kind === 'fixed' && r.person_id === personId;
+  });
+  if (isSundayFixed) {
+    return round2(rateOn('adhoc', null, date, rates));
+  }
+
+  // Step 4: default normal rate (weekday-aware)
+  return round2(rateOn('normal', personId, date, rates, {}));
+}
+
+// P18: automatic 5th-week shift add-on for staff (effective from 2026-11 onwards)
+function fifthWeekAddons(ym, data) {
+  if (!ym || ym < '2026-11') return [];
+  var days = datesOfMonth(ym);
+  var counts = {};
+  var out = [];
+
+  days.forEach(function (d) {
+    var wd = weekdayOf(d);
+    var rows = templateFor(d, data.templates).filter(function (r) { return r.weekday === wd; });
+
+    rows.forEach(function (r) {
+      if (r.kind === 'fixed' && r.person_id) {
+        var key = r.person_id + '|fixed|' + wd;
+        counts[key] = (counts[key] || 0) + 1;
+        var count = counts[key];
+        if (count > 4) {
+          var p = personById(r.person_id, data);
+          if (p && p.group === 'staff') {
+            var amt = fifthWeekRate(p.id, d, data);
+            out.push({
+              person_id: p.id,
+              date: d,
+              weekday: wd,
+              kind: 'fixed',
+              occurrence: count,
+              amount: amt,
+              bucket: 'slip',
+              label: thaiShortDate(d) + ' เวรสัปดาห์ที่ 5 +' + fmt2(amt)
+            });
+          }
+        }
+      } else if (r.kind === 'alt') {
+        var persons = (r.persons || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        var n = persons.length;
+        if (n && r.alt_anchor) {
+          var diff = daysBetween(r.alt_anchor, d);
+          var idx = (((Math.floor(diff / 7)) % n) + n) % n;
+          var pid = persons[idx];
+          if (pid) {
+            var key2 = pid + '|alt|' + wd;
+            counts[key2] = (counts[key2] || 0) + 1;
+            var altCount = counts[key2];
+            var quota = n >= 2 ? 2 : 4;
+            if (altCount > quota) {
+              var p2 = personById(pid, data);
+              if (p2 && p2.group === 'staff') {
+                var amt2 = fifthWeekRate(p2.id, d, data);
+                out.push({
+                  person_id: p2.id,
+                  date: d,
+                  weekday: wd,
+                  kind: 'alt',
+                  occurrence: altCount,
+                  amount: amt2,
+                  bucket: 'slip',
+                  label: thaiShortDate(d) + ' เวรสัปดาห์ที่ 5 (สลับ) +' + fmt2(amt2)
+                });
+              }
+            }
+          }
+        }
+      }
+    });
+  });
+
+  return out;
+}
+
 function monthPayout(ym, data) {
   var peopleMap = {};
   var tempsMap = {};
@@ -1156,6 +1267,18 @@ function monthPayout(ym, data) {
       else if (line.amount < 0) entry.minus = round2(entry.minus - line.amount);
       entry.lines.push(line.label);
     });
+  });
+
+  // P18: automatic 5th-week shift add-on for staff (effective from 2026-11).
+  fifthWeekAddons(ym, data).forEach(function (line) {
+    var p = personById(line.person_id, data);
+    var nick = p ? p.nick : line.person_id;
+    if (!peopleMap[line.person_id]) {
+      peopleMap[line.person_id] = { id: line.person_id, nick: nick, plus: 0, minus: 0, lines: [] };
+    }
+    var entry = peopleMap[line.person_id];
+    if (line.amount > 0) entry.plus = round2(entry.plus + line.amount);
+    entry.lines.push(line.label);
   });
 
   // P13: confirmed company-party referral fees (bucket slip -> CSV other_earn).
@@ -1384,6 +1507,8 @@ if (typeof module !== 'undefined') {
     personFutureBookings: personFutureBookings,
     deactivateBlockers: deactivateBlockers,
     personUsage: personUsage,
-    personUsageText: personUsageText
+    personUsageText: personUsageText,
+    fifthWeekRate: fifthWeekRate,
+    fifthWeekAddons: fifthWeekAddons
   };
 }

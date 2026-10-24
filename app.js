@@ -2242,6 +2242,27 @@
       settingsState.modal = templateModalHtml(d);
       drawSettingsOwner();
     };
+    actions.addTplAlt = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var draft = settingsState.tplDraft;
+      var maxOrder = draft.rows.filter(function (r) { return r.weekday === wd; }).reduce(function (a, r) { return Math.max(a, r.slot_order); }, -1);
+      draft.rows.push({ weekday: wd, slot_order: maxOrder + 1, kind: 'alt', person_id: '', persons: '', alt_anchor: '' });
+      settingsState.modal = templateModalHtml(d);
+      drawSettingsOwner();
+    };
+    actions.removeTplAlt = function (el) {
+      var wd = Number(el.getAttribute('data-wd'));
+      var aIdx = Number(el.getAttribute('data-aidx') || 0);
+      var draft = settingsState.tplDraft;
+      var altRows = draft.rows.filter(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+      var target = altRows[aIdx];
+      if (target) {
+        var idx = draft.rows.indexOf(target);
+        if (idx >= 0) draft.rows.splice(idx, 1);
+      }
+      settingsState.modal = templateModalHtml(d);
+      drawSettingsOwner();
+    };
     actions.toggleTplAlt = function (el) {
       var wd = Number(el.getAttribute('data-wd'));
       var draft = settingsState.tplDraft;
@@ -2259,13 +2280,17 @@
     };
     actions.setTplAltPersons = function (el) {
       var wd = Number(el.getAttribute('data-wd'));
-      var row = settingsState.tplDraft.rows.find(function (r) { return r.weekday === wd && r.kind === 'alt'; });
-      if (row) row.persons = el.value;
+
+      var aIdx = Number(el.getAttribute('data-aidx') || 0);
+      var altRows = settingsState.tplDraft.rows.filter(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+      if (altRows[aIdx]) altRows[aIdx].persons = el.value;
     };
     actions.setTplAltAnchor = function (el) {
       var wd = Number(el.getAttribute('data-wd'));
-      var row = settingsState.tplDraft.rows.find(function (r) { return r.weekday === wd && r.kind === 'alt'; });
-      if (row) row.alt_anchor = el.value;
+
+      var aIdx = Number(el.getAttribute('data-aidx') || 0);
+      var altRows = settingsState.tplDraft.rows.filter(function (r) { return r.weekday === wd && r.kind === 'alt'; });
+      if (altRows[aIdx]) altRows[aIdx].alt_anchor = el.value;
     };
     actions.saveTemplateForm = function (el) {
       var draft = settingsState.tplDraft;
@@ -2415,18 +2440,26 @@
       var rows = draft.rows.filter(function (r) { return r.weekday === wd; });
       var fixedIds = rows.filter(function (r) { return r.kind === 'fixed'; }).map(function (r) { return r.person_id; });
       var hasTue = rows.some(function (r) { return r.kind === 'tue_slot'; });
-      var altRow = rows.find(function (r) { return r.kind === 'alt'; });
+      var altRows = rows.filter(function (r) { return r.kind === 'alt'; });
+      var altHtml = altRows.map(function (ar, aIdx) {
+        return '<div style="display:grid;grid-template-columns:minmax(0,1fr) 130px auto;gap:8px;margin-top:6px;align-items:center">' +
+          '<input data-oninput="setTplAltPersons" data-wd="' + wd + '" data-aidx="' + aIdx + '" placeholder="รหัสคน 4 หลัก คั่นด้วย ," value="' + esc(ar.persons || '') + '" style="height:40px">' +
+          '<input type="date" data-oninput="setTplAltAnchor" data-wd="' + wd + '" data-aidx="' + aIdx + '" value="' + esc(ar.alt_anchor || '') + '" style="height:40px">' +
+          '<button type="button" class="btn-outline" style="height:40px;padding:0 10px;color:#9B1C12;border-color:#F2AEA3" data-act="removeTplAlt" data-wd="' + wd + '" data-aidx="' + aIdx + '">ลบ</button>' +
+          '</div>';
+      }).join('');
       var checks = people.map(function (p) {
         return '<label class="checkbox-row" style="margin-top:4px"><input type="checkbox" data-onchange="toggleTplPerson" data-wd="' + wd + '" data-id="' + p.id + '" ' + (fixedIds.indexOf(p.id) !== -1 ? 'checked' : '') + '>' + esc(p.nick) + '</label>';
       }).join('');
       return '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #F0EAE0"><div style="font-size:13px;font-weight:600">' + WD_LABEL_SHORT[wd] + '</div>' +
         checks +
         '<label class="checkbox-row" style="margin-top:8px"><input type="checkbox" data-onchange="toggleTplTue" data-wd="' + wd + '" ' + (hasTue ? 'checked' : '') + '>ช่องอังคาร (tue_slot)</label>' +
-        '<label class="checkbox-row" style="margin-top:6px"><input type="checkbox" data-onchange="toggleTplAlt" data-wd="' + wd + '" ' + (altRow ? 'checked' : '') + '>ศุกร์เว้นศุกร์ (alt)</label>' +
-        (altRow ? '<div style="display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:8px;margin-top:6px">' +
-          '<input data-oninput="setTplAltPersons" data-wd="' + wd + '" placeholder="รหัสคน 4 หลัก คั่นด้วย ," value="' + esc(altRow.persons || '') + '" style="height:40px">' +
-          '<input type="date" data-oninput="setTplAltAnchor" data-wd="' + wd + '" value="' + esc(altRow.alt_anchor || '') + '" style="height:40px">' +
-          '</div>' : '') +
+        altHtml +
+        '<div style="margin-top:6px"><button type="button" class="btn-outline" style="height:34px;padding:0 12px;font-size:12px" data-act="addTplAlt" data-wd="' + wd + '">+ เพิ่มช่องสลับวีคเว้นวีค (alt)</button></div>' +
+
+
+
+
         '</div>';
     }).join('');
     return '<div class="modal-backdrop" data-act="closeModalBg"><div class="modal-sheet" data-act="stop">' +
