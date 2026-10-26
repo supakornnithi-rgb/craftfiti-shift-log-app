@@ -123,6 +123,59 @@ function resolvePayPeriod(event, data) {
   return eventMonth;
 }
 
+// P19: sub_pay may be 'normal', 'adhoc', 'temp', '', or '<mode>@<YYYY-MM>' when a team substitute
+// is added/changed after the absentee's pay period is already closed.
+function subPayModeOf(event) {
+  var raw = String((event && event.sub_pay) || '').split('@')[0];
+  return raw === 'adhoc' ? 'adhoc' : 'normal';
+}
+
+function subPayPeriodOf(event) {
+  var raw = String((event && event.sub_pay) || '');
+  var at = raw.indexOf('@');
+  if (at !== -1) {
+    var ym = raw.slice(at + 1).trim();
+    if (ym) return ym;
+  }
+  return payPeriodOf(event);
+}
+
+// P19: true when an event whose primary pay_period is closed is still allowed to have its
+// substitute (person2_id / sub_pay / cover / note) edited.
+function canEditClosedEventSub(orig, data) {
+  if (!orig || orig.status === 'deleted') return false;
+  if (orig.type !== 'absent' && orig.type !== 'emergency') return false;
+  if (orig.off_schedule) return false;
+  var origPeriod = payPeriodOf(orig);
+  if (!isClosedYm(origPeriod, data.periods)) return false;
+  if (!orig.person2_id) return true;
+  var sub = personById(orig.person2_id, data);
+  if (!sub || sub.group === 'temp') return true;
+  // team substitute (director/staff): editable only if their pay was carried to a period that is still open
+  var subPeriod = subPayPeriodOf(orig);
+  return subPeriod !== origPeriod && !isClosedYm(subPeriod, data.periods);
+}
+
+// P19: computes the stored `sub_pay` value for an event being saved.
+function resolveSubPay(event, data, origEvent) {
+  if (!event || (event.type !== 'absent' && event.type !== 'emergency') || event.off_schedule || !event.person2_id) {
+    return '';
+  }
+  var sub = personById(event.person2_id, data);
+  if (!sub) return '';
+  if (sub.group === 'temp') return 'temp';
+  var mode = sub.group === 'director' ? 'adhoc' : subPayModeOf(event);
+  if (origEvent && isClosedYm(payPeriodOf(origEvent), data.periods)) {
+    var origPeriod = payPeriodOf(origEvent);
+    var prevSubPeriod = subPayPeriodOf(origEvent);
+    var targetYm = (prevSubPeriod !== origPeriod && !isClosedYm(prevSubPeriod, data.periods))
+      ? prevSubPeriod
+      : firstOpenPeriodFrom(origPeriod, data.periods);
+    return mode + '@' + targetYm;
+  }
+  return mode;
+}
+
 function personById(id, data) {
   return (data.people || []).find(function (p) { return p.id === id; }) || null;
 }
@@ -515,7 +568,7 @@ function eventMoney(event, data) {
         label: d + ' เข้าแทน ' + absentee.nick + half + ' (AdHoc) +' + fmt2(subAmt)
       });
     } else if (sub && sub.group === 'staff') {
-      var payMode = event.sub_pay === 'adhoc' ? 'adhoc' : 'normal';
+      var payMode = subPayModeOf(event);
       var sAmt = payMode === 'adhoc'
         ? round2(rateOn('adhoc', null, event.date, data.rates) * portion)
         : round2(rateOn('normal', sub.id, event.date, data.rates, { replaces: event.person_id }) * portion);
@@ -596,7 +649,7 @@ function effectivePay(event, data) {
   if (!sub) return '';
   if (sub.group === 'director') return 'adhoc';
   if (sub.group === 'temp') return 'temp';
-  return event.sub_pay === 'adhoc' ? 'adhoc' : 'normal';
+  return subPayModeOf(event);
 }
 
 // ---------- calendar titles ----------
@@ -655,9 +708,36 @@ function cloneDataWithoutEvent(data, editingId) {
   return clone;
 }
 
-// Shared pay-period checks for absent/emergency/adhoc/swap (P6 §4.1.4). Pushes Thai error
+// Shared pay-period checks for absent/emergency/adhoc/swap (P6 §4.1.4, P19). Pushes Thai error
 // messages into `errors` and returns the resolved pay period (or null if it could not be resolved).
 function applyPayPeriodChecks_(event, data, editingId, errors) {
+  if (editingId) {
+    var orig = (data.events || []).find(function (e) { return e.event_id === editingId; });
+    if (orig) {
+      var origPeriod = payPeriodOf(orig);
+      if (isClosedYm(origPeriod, data.periods)) {
+        if (!canEditClosedEventSub(orig, data)) {
+          errors.push('รายการนี้คิดเงินในงวด ' + origPeriod + ' ที่ปิดแล้ว แก้ไขไม่ได้');
+          return origPeriod;
+        }
+        var lockedChanged = event.type !== orig.type ||
+          (event.date || '') !== (orig.date || '') ||
+          (event.person_id || '') !== (orig.person_id || '') ||
+          Number(event.portion || 1) !== Number(orig.portion || 1) ||
+          (!!event.off_schedule) !== (!!orig.off_schedule) ||
+          (event.deduct_mode || '') !== (orig.deduct_mode || '');
+        if (lockedChanged) {
+          errors.push('งวด ' + origPeriod + ' ปิดแล้ว แก้ได้เฉพาะคนเข้าแทนและหมายเหตุ (ห้ามเปลี่ยนคนขาด/วันที่/ประเภท/สัดส่วนวัน)');
+        }
+        var origPaid = orig.temp_paid === true || orig.temp_paid === 'TRUE' || orig.temp_paid === 'true';
+        if (origPaid && (event.person2_id || '') !== (orig.person2_id || '')) {
+          errors.push('คนนอกคนเดิมติ๊กจ่ายเงินแล้ว — เอาติ๊ก "จ่ายแล้ว" ออกในหน้าสรุปเงินก่อนเปลี่ยนคนแทน');
+        }
+        return origPeriod;
+      }
+    }
+  }
+
   var resolved = null;
   try {
     resolved = resolvePayPeriod(event, data);
@@ -667,15 +747,6 @@ function applyPayPeriodChecks_(event, data, editingId, errors) {
   // Guard: should not happen after resolve, but never allow saving into a closed period.
   if (resolved && isClosedYm(resolved, data.periods)) {
     errors.push('งวดคิดเงิน ' + resolved + ' ปิดแล้ว แก้ไขไม่ได้');
-  }
-  if (editingId) {
-    var orig = (data.events || []).find(function (e) { return e.event_id === editingId; });
-    if (orig) {
-      var origPeriod = payPeriodOf(orig);
-      if (isClosedYm(origPeriod, data.periods)) {
-        errors.push('รายการนี้คิดเงินในงวด ' + origPeriod + ' ที่ปิดแล้ว แก้ไขไม่ได้');
-      }
-    }
   }
   return resolved;
 }
@@ -797,7 +868,7 @@ function validateEvent(event, data, editingId) {
           if (subEntry && subEntry.id) {
             errors.push(subNick + ' มีเวรอยู่แล้ววันนี้');
           }
-          if (sub.group === 'director' && event.sub_pay === 'normal') {
+          if (sub.group === 'director' && String(event.sub_pay || '').split('@')[0] === 'normal') {
             warnings.push('กรรมการเข้าแทนคิดเป็น AdHoc อัตโนมัติ');
           }
         }
@@ -865,9 +936,25 @@ function previewEvent(event, data, editingId) {
   var v = validateEvent(event, data, editingId);
   var title = '';
   var money = [];
+  var orig = editingId && (data.events || []).find(function (e) { return e.event_id === editingId; });
+  var closedSubEdit = !!(orig && canEditClosedEventSub(orig, data));
+  var resolvedSub = null;
+  var subPayPeriod = null;
+
+  var evForCalc = event;
+  if (closedSubEdit) {
+    resolvedSub = resolveSubPay(event, data, orig);
+    evForCalc = {};
+    for (var k in event) evForCalc[k] = event[k];
+    evForCalc.sub_pay = resolvedSub;
+    if (resolvedSub && resolvedSub.indexOf('@') !== -1) {
+      subPayPeriod = resolvedSub.split('@')[1];
+    }
+  }
+
   try {
-    title = calendarTitle(event, data);
-    money = eventMoney(event, data);
+    title = calendarTitle(evForCalc, data);
+    money = eventMoney(evForCalc, data);
   } catch (err) {
     // amounts may fail if rates are missing; surface as validation error instead of throwing
     v.errors.push(err.message);
@@ -876,13 +963,24 @@ function previewEvent(event, data, editingId) {
   // errors from an invalid explicit pay_period are already reported via validateEvent above.
   var payPeriod = null;
   var payForced = false;
-  if (event && event.date) {
+  if (closedSubEdit) {
+    payPeriod = payPeriodOf(orig);
+    payForced = false;
+  } else if (event && event.date) {
     try {
       payPeriod = resolvePayPeriod(event, data);
     } catch (err2) { /* already surfaced in v.errors */ }
     payForced = isClosedYm(event.date.slice(0, 7), data.periods);
   }
-  return { title: title, money: money, errors: v.errors, warnings: v.warnings, pay_period: payPeriod, pay_forced: payForced };
+  return {
+    title: title,
+    money: money,
+    errors: v.errors,
+    warnings: v.warnings,
+    pay_period: payPeriod,
+    pay_forced: payForced,
+    sub_pay_period: subPayPeriod || null
+  };
 }
 
 // ---------- staffing alerts (P9 section 4.2) ----------
@@ -1205,13 +1303,22 @@ function monthPayout(ym, data) {
   (data.events || []).forEach(function (e) {
     if (e.status === 'deleted') return;
     if (e.type === 'swap') return;
-    if (payPeriodOf(e) !== ym) return;
+    var mainPeriod = payPeriodOf(e);
+    var subPeriod = subPayPeriodOf(e);
+    if (mainPeriod !== ym && subPeriod !== ym) return;
     var dateMonth = e.date.slice(0, 7);
-    var isCarried = dateMonth !== ym;
-    if (isCarried) carried++;
-    var suffix = isCarried ? ' (ยกมาจาก ' + monthShortYear(dateMonth) + ')' : '';
+    var countedCarry = false;
     var lines = eventMoney(e, data);
     lines.forEach(function (line) {
+      var isSubLine = (e.type === 'absent' || e.type === 'emergency') && e.person2_id && line.person_id === e.person2_id;
+      var linePeriod = isSubLine ? subPeriod : mainPeriod;
+      if (linePeriod !== ym) return;
+      var isCarried = dateMonth !== ym;
+      if (isCarried && !countedCarry) {
+        carried++;
+        countedCarry = true;
+      }
+      var suffix = isCarried ? ' (ยกมาจาก ' + monthShortYear(dateMonth) + ')' : '';
       var label = line.label + suffix;
       if (line.bucket === 'slip') {
         var p = personById(line.person_id, data);
@@ -1443,6 +1550,9 @@ function monthView(ym, data) {
       // Derived (not stored): lets the UI hide edit/delete for a specific event without
       // needing to fetch the closed status of a different month's period.
       enriched.pay_closed = isClosedYm(enriched.pay_period, data.periods);
+      enriched.sub_pay_period = subPayPeriodOf(e);
+      enriched.sub_pay_carried = enriched.sub_pay_period !== e.date.slice(0, 7) && enriched.sub_pay_period !== enriched.pay_period;
+      enriched.can_edit_sub = enriched.pay_closed ? canEditClosedEventSub(e, data) : false;
       return enriched;
     });
     var out = { date: dr.date, weekday: dr.weekday, roster: dr.roster, events: events };
@@ -1472,6 +1582,10 @@ if (typeof module !== 'undefined') {
     payPeriodOf: payPeriodOf,
     firstOpenPeriodFrom: firstOpenPeriodFrom,
     resolvePayPeriod: resolvePayPeriod,
+    subPayModeOf: subPayModeOf,
+    subPayPeriodOf: subPayPeriodOf,
+    canEditClosedEventSub: canEditClosedEventSub,
+    resolveSubPay: resolveSubPay,
     rateOn: rateOn,
     templateFor: templateFor,
     baseRoster: baseRoster,

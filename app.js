@@ -840,7 +840,8 @@
     if (a.kind === 'pending_cover') {
       var ev = a.event_id ? findEvent(a.event_id) : null;
       var closed = ev && window.isClosedYm(window.payPeriodOf(ev), state.bundle.periods);
-      if (!closed) btn = '<button type="button" class="btn-outline" data-act="alertFindCover" data-date="' + date + '" data-id="' + esc(a.event_id) + '">หาคนแทน</button>';
+      var canEdit = ev && (!closed || window.canEditClosedEventSub(ev, state.bundle));
+      if (canEdit) btn = '<button type="button" class="btn-outline" data-act="alertFindCover" data-date="' + date + '" data-id="' + esc(a.event_id) + '">หาคนแทน</button>';
     } else if (a.kind === 'tue_unassigned') {
       btn = '<button type="button" class="btn-outline" data-act="alertTuePlanner">จัดช่องอังคาร</button>';
     } else {
@@ -897,6 +898,7 @@
         var tag = (e.type === 'absent' && e.portion === 0.5) ? 'ขาดครึ่งวัน' : TYPE_TAG[e.type];
         // P6 §4.4.3: small pill when this event's money was carried to a different pay period.
         var carriedPill = e.pay_carried ? '<span class="pill" style="background:#EDE3D0;color:#6B4A17">คิดเงิน ' + esc(THAI_MONTH_SHORT[Number(e.pay_period.slice(5, 7)) - 1]) + '</span>' : '';
+        var subCarriedPill = e.sub_pay_carried ? '<span class="pill" style="background:#EDE3D0;color:#6B4A17">คนแทนคิดเงิน ' + esc(THAI_MONTH_SHORT[Number(e.sub_pay_period.slice(5, 7)) - 1]) + '</span>' : '';
         var moneyHtml = (e.money || []).map(function (line) {
           var cls = line.amount > 0 ? 'amt-pos' : (line.amount < 0 ? 'amt-neg' : 'amt-zero');
           var text = line.label + (line.bucket === 'temp' ? ' · จ่ายนอกสลิป' : '');
@@ -907,13 +909,19 @@
         if (e.note) meta += ' · ' + esc(e.note);
         meta += ' · ' + (e.cal_status === 'ok' ? 'ส่งเข้า Calendar แล้ว' : (e.cal_status === 'pending' ? 'กำลังส่งเข้า Calendar…' : '⚠️ ยังไม่เข้า Calendar'));
         // P6 §4.4.3: hide edit/delete based on the EVENT's own pay period being closed, not the day's month.
-        var editDelete = e.pay_closed ? '' :
-          '<div style="display:flex;gap:14px;margin-top:8px">' +
-          '<button type="button" data-act="editEvent" data-id="' + esc(e.event_id) + '" style="font-size:12px;font-weight:600;color:#9A4F0E">แก้ไข</button>' +
-          '<button type="button" data-act="deleteEvent" data-id="' + esc(e.event_id) + '" class="btn-danger" style="font-size:12px;font-weight:600">ลบ</button>' +
-          '</div>';
+        // P19: if closed but original sub was temp/none, allow editing the substitute.
+        var editDelete = !e.pay_closed
+          ? '<div style="display:flex;gap:14px;margin-top:8px">' +
+            '<button type="button" data-act="editEvent" data-id="' + esc(e.event_id) + '" style="font-size:12px;font-weight:600;color:#9A4F0E">แก้ไข</button>' +
+            '<button type="button" data-act="deleteEvent" data-id="' + esc(e.event_id) + '" class="btn-danger" style="font-size:12px;font-weight:600">ลบ</button>' +
+            '</div>'
+          : (e.can_edit_sub
+            ? '<div style="display:flex;gap:14px;margin-top:8px">' +
+              '<button type="button" data-act="editEvent" data-id="' + esc(e.event_id) + '" style="font-size:12px;font-weight:600;color:#9A4F0E">แก้ไขคนแทน</button>' +
+              '</div>'
+            : '');
         return '<div class="event-card">' +
-          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="' + TYPE_PILLCLS[e.type] + '">' + esc(tag) + '</span><span style="font-size:14px;font-weight:500">' + esc(e.title) + '</span>' + carriedPill + '</div>' +
+          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="' + TYPE_PILLCLS[e.type] + '">' + esc(tag) + '</span><span style="font-size:14px;font-weight:500">' + esc(e.title) + '</span>' + carriedPill + subCarriedPill + '</div>' +
           moneyHtml +
           '<div class="event-meta">' + meta + '</div>' +
           editDelete +
@@ -984,6 +992,7 @@
       dayRoster: [], dayRoster2: [],
       payPeriodChoice: 'event', dateMonthClosed: false,
       offSchedule: false, deductMode: 'adhoc', // P8 section 4.4: off-schedule absence
+      closedSubOnly: false, // P19: closed pay period where only substitute/note can be edited
       preview: { title: '', money: [], errors: [], warnings: [] }
     };
     if (editingEvent) {
@@ -1005,7 +1014,7 @@
         if (e.person2_id) {
           var subP = personById(e.person2_id);
           if (subP && subP.group === 'temp') { recState.subMode = 'outside'; recState.tempSub = e.person2_id; }
-          else { recState.subMode = 'team'; recState.teamSub = e.person2_id; recState.payMode = e.sub_pay === 'adhoc' ? 'adhoc' : 'normal'; }
+          else { recState.subMode = 'team'; recState.teamSub = e.person2_id; recState.payMode = window.subPayModeOf ? window.subPayModeOf(e) : (e.sub_pay === 'adhoc' ? 'adhoc' : 'normal'); }
         } else {
           // legacy events (no substitute, blank cover) count as "ไม่ต้องมีคนแทน"
           recState.subMode = e.cover === 'pending' ? 'pending' : 'none';
@@ -1016,6 +1025,7 @@
         recState.swapA = e.person_id;
         recState.swapB = e.person2_id;
       }
+      recState.closedSubOnly = !!(state.bundle && window.isClosedYm(window.payPeriodOf(e), state.bundle.periods) && window.canEditClosedEventSub(e, state.bundle));
     }
   }
 
@@ -1178,14 +1188,18 @@
       var carried = pv.pay_period !== evMonth;
       payPeriodLine = '<div style="font-size:13px;font-weight:500;margin-top:4px">คิดเงินงวด: ' + esc(monthYearShort(pv.pay_period)) + (carried ? ' (ยกไปเดือนถัดไป)' : '') + '</div>';
     }
+    var subPayPeriodLine = '';
+    if (pv.sub_pay_period && pv.sub_pay_period !== pv.pay_period) {
+      subPayPeriodLine = '<div style="font-size:13px;font-weight:500;margin-top:4px;color:#9A4F0E">เงินคนเข้าแทนคิดในงวด: ' + esc(monthYearShort(pv.sub_pay_period)) + ' (ทบไปบิลหน้า)</div>';
+    }
     var previewHtml = '<div class="card" style="margin-top:18px">' +
       '<div style="font-size:13px;font-weight:500">ชื่อใน Calendar: ' + esc(pv.title || '—') + '</div>' +
-      payPeriodLine +
+      payPeriodLine + subPayPeriodLine +
       linesHtml + warnHtml + errHtml +
       '</div>';
     var disableSave = !recRequiredOk() || (pv.errors && pv.errors.length > 0);
     var saveBtnHtml = '<button type="button" class="btn-primary" style="margin-top:14px" data-act="saveRecord"' + (disableSave ? ' disabled' : '') + '>บันทึก</button>';
-    var deleteBtnHtml = recState.eventId ? '<button type="button" class="btn-primary" style="margin-top:10px;background:#FBE1DC;color:#9B1C12" data-act="deleteRecord">ลบเหตุการณ์นี้</button>' : '';
+    var deleteBtnHtml = (recState.eventId && !recState.closedSubOnly) ? '<button type="button" class="btn-primary" style="margin-top:10px;background:#FBE1DC;color:#9B1C12" data-act="deleteRecord">ลบเหตุการณ์นี้</button>' : '';
     return '<div id="previewSaveArea">' + previewHtml + saveBtnHtml + deleteBtnHtml + '</div>';
   }
 
@@ -1327,8 +1341,9 @@
       '<header class="app-header"><div><div class="brand">CRAFTFITI · SHIFT LOG</div><h1>' + esc(title) + '</h1></div></header>' +
       '<main class="app-main">' +
       (recState.saved ? '<div class="saved-box">บันทึกแล้ว' + esc(recState.savedCalNote || '') + '</div>' : '') +
+      (recState.closedSubOnly ? '<div class="warn-box" style="margin-bottom:12px">งวด ' + esc(monthYearShort(recState.date.slice(0, 7))) + ' ปิดแล้ว — แก้ไขได้เฉพาะคนเข้าแทนและหมายเหตุ (หากเลือกทีมงานเข้าแทน เงินจะทบไปงวดถัดไปอัตโนมัติ)</div>' : '') +
       '<label class="lbl" for="recDate" style="margin-top:0">วันที่</label>' +
-      '<input type="date" id="recDate" data-oninput="setDate" value="' + esc(recState.date) + '" style="width:100%;height:48px">' +
+      '<input type="date" id="recDate" data-oninput="setDate" value="' + esc(recState.date) + '"' + (recState.closedSubOnly ? ' disabled' : '') + ' style="width:100%;height:48px">' +
       '<div style="font-size:12px;color:#6B6257;margin-top:6px">เวรวันนี้: ' + esc(rosterNames.join(' · ') || '—') + '</div>' +
       typeHtml + absentHtml + swapHtml + adhocHtml + payPeriodHtml +
       noteHtml + previewSaveHtml() +
@@ -1337,11 +1352,13 @@
       '</div>';
 
     actions.setType = function (el) {
+      if (recState.closedSubOnly) return;
       recState.type = el.getAttribute('data-type');
       if (recState.type !== 'absent') recState.offSchedule = false; // off-schedule is an absence-only option
       loadRosterAndDraw();
     };
     actions.setOffSchedule = function (el) {
+      if (recState.closedSubOnly) return;
       recState.offSchedule = !!el.checked;
       recState.absentee = '';        // the candidate list changes (roster vs everyone)
       recState.subMode = 'pending'; recState.teamSub = ''; recState.tempSub = '';
@@ -1350,10 +1367,10 @@
     };
     actions.setDeductMode = function (el) { recState.deductMode = el.getAttribute('data-m'); refreshRecord(); };
     actions.setPayPeriodChoice = function (el) { recState.payPeriodChoice = el.getAttribute('data-c'); refreshRecord(); };
-    actions.setDate = function (el) { recState.date = el.value; loadRosterAndDraw(); };
-    actions.setDate2 = function (el) { recState.date2 = el.value; loadRosterAndDraw(); };
-    actions.setAbsentee = function (el) { recState.absentee = el.getAttribute('data-id'); refreshRecord(); };
-    actions.setPortion = function (el) { recState.portion = Number(el.getAttribute('data-p')); refreshRecord(); };
+    actions.setDate = function (el) { if (recState.closedSubOnly) return; recState.date = el.value; loadRosterAndDraw(); };
+    actions.setDate2 = function (el) { if (recState.closedSubOnly) return; recState.date2 = el.value; loadRosterAndDraw(); };
+    actions.setAbsentee = function (el) { if (recState.closedSubOnly) return; recState.absentee = el.getAttribute('data-id'); refreshRecord(); };
+    actions.setPortion = function (el) { if (recState.closedSubOnly) return; recState.portion = Number(el.getAttribute('data-p')); refreshRecord(); };
     actions.setSubMode = function (el) { recState.subMode = el.getAttribute('data-m'); refreshRecord(); };
     actions.setTeamSub = function (el) { recState.teamSub = el.getAttribute('data-id'); refreshRecord(); };
     actions.setPayMode = function (el) { recState.payMode = el.getAttribute('data-m'); refreshRecord(); };
