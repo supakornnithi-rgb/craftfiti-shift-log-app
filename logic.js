@@ -140,6 +140,59 @@ function subPayPeriodOf(event) {
   return payPeriodOf(event);
 }
 
+// P21: returns the effective_from date ('YYYY-MM-DD') from which this person's AdHoc shifts
+// (standalone adhoc or substituting in adhoc mode) are paid daily outside payroll (bucket: 'temp'),
+// or '' if the rule does not apply to this person.
+function adhocTempEffectiveFrom(personId, data) {
+  if (!personId || !data) return '';
+  var cfgRaw = data.config && data.config.adhoc_temp;
+  if (cfgRaw) {
+    var list = Array.isArray(cfgRaw) ? cfgRaw : String(cfgRaw).split(',');
+    for (var i = 0; i < list.length; i++) {
+      var item = String(list[i] || '').trim();
+      if (!item) continue;
+      var parts = item.split(':');
+      var pid = String(parts[0] || '').trim();
+      var eff = String(parts[1] || '').trim();
+      if (pid === personId && /^\d{4}-\d{2}-\d{2}$/.test(eff)) {
+        return eff;
+      }
+    }
+  }
+  var rateCandidates = (data.rates || []).filter(function (r) {
+    return r.kind === 'adhoc_temp' && r.person_id === personId && r.effective_from;
+  });
+  if (rateCandidates.length) {
+    var earliest = rateCandidates.reduce(function (a, b) {
+      return b.effective_from < a.effective_from ? b : a;
+    });
+    return earliest.effective_from;
+  }
+  return '';
+}
+
+function isAdhocTempOn(personId, date, data) {
+  if (!personId || !date || !data) return false;
+  var eff = adhocTempEffectiveFrom(personId, data);
+  return !!(eff && date >= eff);
+}
+
+function isTempPayEvent(event, data) {
+  if (!event || event.status === 'deleted' || !data) return false;
+  if (event.type === 'adhoc') {
+    return isAdhocTempOn(event.person_id, event.date, data);
+  }
+  if ((event.type === 'absent' || event.type === 'emergency') && !event.off_schedule && event.person2_id) {
+    var sub = personById(event.person2_id, data);
+    if (!sub) return false;
+    if (sub.group === 'temp') return true;
+    if (sub.group === 'staff' && subPayModeOf(event) === 'adhoc' && isAdhocTempOn(sub.id, event.date, data)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // P19: true when an event whose primary pay_period is closed is still allowed to have its
 // substitute (person2_id / sub_pay / cover / note) edited.
 function canEditClosedEventSub(orig, data) {
@@ -150,7 +203,7 @@ function canEditClosedEventSub(orig, data) {
   if (!isClosedYm(origPeriod, data.periods)) return false;
   if (!orig.person2_id) return true;
   var sub = personById(orig.person2_id, data);
-  if (!sub || sub.group === 'temp') return true;
+  if (!sub || isTempPayEvent(orig, data)) return true;
   // team substitute (director/staff): editable only if their pay was carried to a period that is still open
   var subPeriod = subPayPeriodOf(orig);
   return subPeriod !== origPeriod && !isClosedYm(subPeriod, data.periods);
@@ -165,6 +218,9 @@ function resolveSubPay(event, data, origEvent) {
   if (!sub) return '';
   if (sub.group === 'temp') return 'temp';
   var mode = sub.group === 'director' ? 'adhoc' : subPayModeOf(event);
+  if (sub.group === 'staff' && mode === 'adhoc' && isAdhocTempOn(sub.id, event.date, data)) {
+    return 'adhoc';
+  }
   if (origEvent && isClosedYm(payPeriodOf(origEvent), data.periods)) {
     var origPeriod = payPeriodOf(origEvent);
     var prevSubPeriod = subPayPeriodOf(origEvent);
@@ -514,11 +570,12 @@ function eventMoney(event, data) {
 
   if (event.type === 'adhoc') {
     var amt = round2(rateOn('adhoc', null, event.date, data.rates) * portion);
+    var adhocTemp = isAdhocTempOn(event.person_id, event.date, data);
     return [{
       person_id: event.person_id,
       amount: amt,
-      bucket: 'slip',
-      label: d + ' AdHoc' + half + ' +' + fmt2(amt)
+      bucket: adhocTemp ? 'temp' : 'slip',
+      label: d + ' AdHoc' + half + (adhocTemp ? ' (จ่ายรายวัน)' : '') + ' +' + fmt2(amt)
     }];
   }
 
@@ -572,11 +629,12 @@ function eventMoney(event, data) {
       var sAmt = payMode === 'adhoc'
         ? round2(rateOn('adhoc', null, event.date, data.rates) * portion)
         : round2(rateOn('normal', sub.id, event.date, data.rates, { replaces: event.person_id }) * portion);
-      var tag = payMode === 'adhoc' ? '(AdHoc)' : '(เรทปกติ)';
+      var subAdhocTemp = payMode === 'adhoc' && isAdhocTempOn(sub.id, event.date, data);
+      var tag = subAdhocTemp ? '(AdHoc · จ่ายรายวัน)' : (payMode === 'adhoc' ? '(AdHoc)' : '(เรทปกติ)');
       out.push({
         person_id: event.person2_id,
         amount: sAmt,
-        bucket: 'slip',
+        bucket: subAdhocTemp ? 'temp' : 'slip',
         label: d + ' เข้าแทน ' + absentee.nick + half + ' ' + tag + ' +' + fmt2(sAmt)
       });
     } else if (sub && sub.group === 'temp') {
@@ -730,7 +788,7 @@ function applyPayPeriodChecks_(event, data, editingId, errors) {
           errors.push('งวด ' + origPeriod + ' ปิดแล้ว แก้ได้เฉพาะคนเข้าแทนและหมายเหตุ (ห้ามเปลี่ยนคนขาด/วันที่/ประเภท/สัดส่วนวัน)');
         }
         var origPaid = orig.temp_paid === true || orig.temp_paid === 'TRUE' || orig.temp_paid === 'true';
-        if (origPaid && (event.person2_id || '') !== (orig.person2_id || '')) {
+        if (origPaid && ((event.person2_id || '') !== (orig.person2_id || '') || !isTempPayEvent(event, data))) {
           errors.push('คนนอกคนเดิมติ๊กจ่ายเงินแล้ว — เอาติ๊ก "จ่ายแล้ว" ออกในหน้าสรุปเงินก่อนเปลี่ยนคนแทน');
         }
         return origPeriod;
@@ -1236,6 +1294,7 @@ function fifthWeekAddons(ym, data) {
   days.forEach(function (d) {
     var wd = weekdayOf(d);
     var rows = templateFor(d, data.templates).filter(function (r) { return r.weekday === wd; });
+    var altSlotIdx = 0;
 
     rows.forEach(function (r) {
       if (r.kind === 'fixed' && r.person_id) {
@@ -1259,6 +1318,7 @@ function fifthWeekAddons(ym, data) {
           }
         }
       } else if (r.kind === 'alt') {
+        var curAltIdx = altSlotIdx++;
         var persons = (r.persons || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
         var n = persons.length;
         if (n && r.alt_anchor) {
@@ -1266,7 +1326,7 @@ function fifthWeekAddons(ym, data) {
           var idx = (((Math.floor(diff / 7)) % n) + n) % n;
           var pid = persons[idx];
           if (pid) {
-            var key2 = pid + '|alt|' + wd;
+            var key2 = pid + '|alt|' + wd + '|' + curAltIdx;
             counts[key2] = (counts[key2] || 0) + 1;
             var altCount = counts[key2];
             var quota = n >= 2 ? 2 : 4;
@@ -1336,6 +1396,7 @@ function monthPayout(ym, data) {
         if (!tempsMap[line.person_id]) {
           tempsMap[line.person_id] = {
             id: line.person_id, nick: tnick, bank: (tp && tp.bank) || '', account_no: (tp && tp.account_no) || '',
+            group: (tp && tp.group) || 'temp',
             amount: 0, paidAmount: 0, unpaidAmount: 0, lines: [], days: []
           };
         }
@@ -1343,9 +1404,10 @@ function monthPayout(ym, data) {
         tentry.amount = round2(tentry.amount + line.amount);
         tentry.lines.push(label);
         var isPaid = e.temp_paid === true || e.temp_paid === 'TRUE' || e.temp_paid === 'true';
+        var dayLabel = e.type === 'adhoc' ? ('มาช่วยร้าน (AdHoc)' + (e.portion === 0.5 ? ' ครึ่งวัน' : '')) : ('แทน ' + nickOf(e.person_id, data) + (e.portion === 0.5 ? ' ครึ่งวัน' : ''));
         tentry.days.push({
           event_id: e.event_id, date: e.date,
-          label: 'แทน ' + nickOf(e.person_id, data) + (e.portion === 0.5 ? ' ครึ่งวัน' : ''),
+          label: dayLabel,
           amount: line.amount, paid: isPaid,
           paid_by: isPaid ? (e.temp_paid_by || '') : '', paid_at: isPaid ? (e.temp_paid_at || '') : ''
         });
@@ -1623,6 +1685,9 @@ if (typeof module !== 'undefined') {
     personUsage: personUsage,
     personUsageText: personUsageText,
     fifthWeekRate: fifthWeekRate,
-    fifthWeekAddons: fifthWeekAddons
+    fifthWeekAddons: fifthWeekAddons,
+    adhocTempEffectiveFrom: adhocTempEffectiveFrom,
+    isAdhocTempOn: isAdhocTempOn,
+    isTempPayEvent: isTempPayEvent
   };
 }

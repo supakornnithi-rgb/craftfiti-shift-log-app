@@ -84,6 +84,33 @@
     return activeDirectorsStaff().filter(function (p) { return working.indexOf(p.id) === -1; });
   }
 
+  // P21: reminder flag warning box for persons configured with adhoc_temp
+  function adhocTempFlagHtmlFor(personIds) {
+    if (!personIds || !personIds.length || !state.bundle) return '';
+    var fn = (typeof adhocTempEffectiveFrom === 'function')
+      ? adhocTempEffectiveFrom
+      : (typeof window !== 'undefined' && window.adhocTempEffectiveFrom);
+    if (!fn) return '';
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < personIds.length; i++) {
+      var id = personIds[i];
+      if (!id || seen[id]) continue;
+      seen[id] = true;
+      var eff = fn(id, state.bundle);
+      if (!eff) continue;
+      var nick = esc(nickOf(id));
+      out.push(
+        '<div class="warn-box" style="margin-top:10px;border-left:4px solid #D97706;background:#FFFBEB;color:#78350F">' +
+        '🚩 <strong>แจ้งเตือนวิธีคิดเงินเดือนของ ' + nick + ' (กันลืม):</strong><br>' +
+        '1. ตั้งแต่ ธ.ค. 2026 การเข้างานแบบ <strong>AdHoc</strong> (มาช่วยร้าน / เข้าแทนแบบ AdHoc) จะไม่นำไปรวมในเงินเดือน แต่จะขึ้นในหมวด <strong>"จ้างชั่วคราว"</strong> ให้โอนจ่ายรายวันเหมือนคนนอก<br>' +
+        '2. ตั้งแต่ ม.ค. 2027 ' + nick + ' มีเวรวันศุกร์เพิ่มเป็นทุกศุกร์ (สลับ 2 คู่ รวมเป็น 8 เวร/เดือน) อย่าลืมตรวจสอบ/ปรับฐานเงินเดือนในระบบ Payroll' +
+        '</div>'
+      );
+    }
+    return out.join('');
+  }
+
   // ---------- toast / loading ----------
   var toastEl = null;
   // P9 4.1: copy digits to the clipboard (navigator.clipboard, fallback select + execCommand).
@@ -1181,6 +1208,7 @@
     }).join('');
     var warnHtml = (pv.warnings || []).map(function (w) { return '<div class="warn-box">' + esc(w) + '</div>'; }).join('');
     var errHtml = (pv.errors || []).map(function (w) { return '<div class="error-box">' + esc(w) + '</div>'; }).join('');
+    var flagHtml = adhocTempFlagHtmlFor([recState.absentee, recState.teamSub, recState.adhocPerson]);
     // P6 §4.4.2: pay period line, with "(ยกไปเดือนถัดไป)" when it differs from the event's own month.
     var payPeriodLine = '';
     if (pv.pay_period) {
@@ -1195,7 +1223,7 @@
     var previewHtml = '<div class="card" style="margin-top:18px">' +
       '<div style="font-size:13px;font-weight:500">ชื่อใน Calendar: ' + esc(pv.title || '—') + '</div>' +
       payPeriodLine + subPayPeriodLine +
-      linesHtml + warnHtml + errHtml +
+      linesHtml + warnHtml + errHtml + flagHtml +
       '</div>';
     var disableSave = !recRequiredOk() || (pv.errors && pv.errors.length > 0);
     var saveBtnHtml = '<button type="button" class="btn-primary" style="margin-top:14px" data-act="saveRecord"' + (disableSave ? ' disabled' : '') + '>บันทึก</button>';
@@ -1686,13 +1714,19 @@
         return '<div class="temp-day"><div><div style="font-weight:500">' + esc(ddmm(d.date)) + ' · ' + esc(d.label) + '</div>' +
           '<div style="color:#6B6257">' + money2(d.amount) + (isOwner && d.paid ? ' · จ่ายโดย ' + esc(d.paid_by || '') + ' ' + esc(ddmm(d.paid_at)) : '') + '</div></div>' + ctl + '</div>';
       }).join('');
+      var grpLabel = t.group === 'staff' ? 'พนักงาน · AdHoc จ่ายรายวัน ★' : 'คนนอก ★';
       return '<div style="padding:10px 14px;border-bottom:1px solid #F0EAE0">' +
-        '<div style="display:flex;justify-content:space-between;align-items:baseline"><span style="font-size:14px;font-weight:600">' + esc(t.nick) + ' <span style="font-size:11px;font-weight:400;color:#7A7064">คนนอก ★</span></span>' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline"><span style="font-size:14px;font-weight:600">' + esc(t.nick) + ' <span style="font-size:11px;font-weight:400;color:#7A7064">' + grpLabel + '</span></span>' +
         '<span style="font-size:14px;font-weight:600">' + money2(t.amount) + '</span></div>' +
         bankHtml + '<div style="margin-top:6px">' + daysHtml + '</div></div>';
     }).join('');
 
     var statusPill = payout.closed ? '<span class="status-pill status-pill-closed">งวดปิดแล้ว</span>' : '<span class="status-pill">งวดยังเปิด</span>';
+
+    var flaggedIds = ((state.bundle && state.bundle.people) || []).filter(function (p) {
+      return p.active !== false && (window.adhocTempEffectiveFrom ? window.adhocTempEffectiveFrom(p.id, state.bundle) : false);
+    }).map(function (p) { return p.id; });
+    var flagHtml = adhocTempFlagHtmlFor(flaggedIds);
 
     app.innerHTML =
       '<div class="shell">' +
@@ -1701,6 +1735,7 @@
       statusPill +
       '</header>' +
       '<main class="app-main">' +
+      flagHtml +
       '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">' +
       '<div class="kpi"><div class="l">รายได้อื่นๆ รวม</div><div class="v pos">+' + money2(payout.totPlus) + '</div></div>' +
       '<div class="kpi"><div class="l">ขาดงาน (หัก) รวม</div><div class="v neg">−' + money2(payout.totMinus) + '</div></div>' +
@@ -1959,8 +1994,10 @@
             dedTxt = '–';
           }
         }
+        var hasAdhocTempFlag = !!(window.adhocTempEffectiveFrom && window.adhocTempEffectiveFrom(p.id, state.bundle));
+        var adhocBadge = hasAdhocTempFlag ? ' <span class="pill p-adh" style="font-size:10px;padding:1px 6px;margin-left:4px">AdHoc จ่ายรายวัน</span>' : '';
         return '<button type="button" class="row-btn" data-act="editPerson" data-id="' + esc(p.id) + '" style="display:grid;grid-template-columns:minmax(0,1fr) 70px 96px 64px;align-items:center">' +
-          '<span style="font-size:14px;font-weight:500;text-align:left">' + esc(p.nick) + ' <span style="font-size:11px;color:#7A7064">' + esc(p.id) + (p.active ? '' : ' · ปิดใช้งาน') + '</span></span>' +
+          '<span style="font-size:14px;font-weight:500;text-align:left">' + esc(p.nick) + ' <span style="font-size:11px;color:#7A7064">' + esc(p.id) + (p.active ? '' : ' · ปิดใช้งาน') + '</span>' + adhocBadge + '</span>' +
           '<span><span class="g g-' + (g === 'director' ? 'D' : g === 'staff' ? 'S' : 'T') + '">' + groupLabel[g] + '</span></span>' +
           '<span style="text-align:right;font-size:12px">' + rateTxt + '</span>' +
           '<span style="text-align:right;font-size:14px">' + dedTxt + '</span>' +
@@ -2096,7 +2133,7 @@
         }
       }
       var payload = { isNew: false, id: f.id, nick: f.nick, group: f.group, code: f.code, active: false, regular: f.regular };
-      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
+      if (f.group === 'temp' || f.group === 'staff') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
       withSavingButton(el, function () {
         return write('savePerson', payload).then(function () {
           toast('ซ่อน ' + f.nick + ' แล้ว');
@@ -2114,7 +2151,7 @@
     actions.unhidePerson = function (el) {
       var f = settingsState.personForm;
       var payload = { isNew: false, id: f.id, nick: f.nick, group: f.group, code: f.code, active: true, regular: f.regular };
-      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
+      if (f.group === 'temp' || f.group === 'staff') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
       withSavingButton(el, function () {
         return write('savePerson', payload).then(function () {
           toast('แสดง ' + f.nick + ' กลับแล้ว');
@@ -2164,7 +2201,7 @@
       }
 
       var payload = { isNew: isNew, nick: f.nick, group: f.group, code: f.code, active: f.active, regular: f.regular };
-      if (f.group === 'temp') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
+      if (f.group === 'temp' || f.group === 'staff') { payload.bank = (f.bank || '').trim(); payload.account_no = (f.account_no || '').replace(/[^0-9]/g, ''); }
       if (f.id) payload.id = f.id;
       withSavingButton(el, function () {
         return write('savePerson', payload).then(function (res) {
@@ -2407,7 +2444,7 @@
       '<div class="form-row"><label for="pNick">ชื่อเล่น</label><input id="pNick" data-oninput="setPersonField" data-field="nick" value="' + esc(f.nick) + '"></div>' +
       '<div class="form-row"><label for="pGroup">กลุ่ม</label><select id="pGroup" data-onchange="setPersonField" data-field="group">' + groupOpts + '</select></div>' +
       '<div class="form-row"><label for="pCode">โค้ด (ตัวย่อในปฏิทิน)</label><input id="pCode" data-oninput="setPersonField" data-field="code" value="' + esc(f.code) + '"></div>' +
-      (f.group === 'temp'
+      ((f.group === 'temp' || f.group === 'staff')
         ? '<div class="form-row"><label for="pBank">ธนาคาร</label><input id="pBank" data-oninput="setPersonField" data-field="bank" value="' + esc(f.bank) + '" placeholder="เช่น กสิกร"></div>' +
           '<div class="form-row"><label for="pAcct">เลขบัญชี</label><input id="pAcct" data-oninput="setPersonField" data-field="account_no" inputmode="numeric" autocomplete="off" value="' + esc(f.account_no) + '"></div>'
         : '') +
