@@ -123,9 +123,34 @@ function resolvePayPeriod(event, data) {
   return eventMonth;
 }
 
+// P22: from 2026-11-01 onwards, staff substitutes automatically use AdHoc mode and both
+// staff substitutes and standalone staff AdHoc shifts pay max(adhoc rate, staff normal rate).
+var ADHOC_SUB_EFFECTIVE_FROM = '2026-11-01';
+
+function isAdhocSubForcedOn(date) {
+  return !!(date && String(date) >= ADHOC_SUB_EFFECTIVE_FROM);
+}
+
+function staffAdhocRateInfo(personId, date, rates, opts) {
+  var adhocRate = rateOn('adhoc', null, date, rates);
+  var normalRate = null;
+  if (personId) {
+    try {
+      normalRate = rateOn('normal', personId, date, rates, opts || {});
+    } catch (e) {
+      normalRate = null;
+    }
+  }
+  if (normalRate !== null && normalRate > adhocRate) {
+    return { rate: normalRate, usedHigherNormal: true, adhocRate: adhocRate, normalRate: normalRate };
+  }
+  return { rate: adhocRate, usedHigherNormal: false, adhocRate: adhocRate, normalRate: normalRate };
+}
+
 // P19: sub_pay may be 'normal', 'adhoc', 'temp', '', or '<mode>@<YYYY-MM>' when a team substitute
 // is added/changed after the absentee's pay period is already closed.
 function subPayModeOf(event) {
+  if (event && isAdhocSubForcedOn(event.date)) return 'adhoc';
   var raw = String((event && event.sub_pay) || '').split('@')[0];
   return raw === 'adhoc' ? 'adhoc' : 'normal';
 }
@@ -569,13 +594,18 @@ function eventMoney(event, data) {
   var d = thaiShortDate(event.date);
 
   if (event.type === 'adhoc') {
-    var amt = round2(rateOn('adhoc', null, event.date, data.rates) * portion);
+    var adhocPerson = personById(event.person_id, data);
+    var adhocInfo = (adhocPerson && adhocPerson.group === 'staff' && isAdhocSubForcedOn(event.date))
+      ? staffAdhocRateInfo(adhocPerson.id, event.date, data.rates, {})
+      : { rate: rateOn('adhoc', null, event.date, data.rates), usedHigherNormal: false };
+    var amt = round2(adhocInfo.rate * portion);
     var adhocTemp = isAdhocTempOn(event.person_id, event.date, data);
+    var higherTag = adhocInfo.usedHigherNormal ? ' (เรทปกติ)' : '';
     return [{
       person_id: event.person_id,
       amount: amt,
       bucket: adhocTemp ? 'temp' : 'slip',
-      label: d + ' AdHoc' + half + (adhocTemp ? ' (จ่ายรายวัน)' : '') + ' +' + fmt2(amt)
+      label: d + ' AdHoc' + half + higherTag + (adhocTemp ? ' (จ่ายรายวัน)' : '') + ' +' + fmt2(amt)
     }];
   }
 
@@ -626,15 +656,28 @@ function eventMoney(event, data) {
       });
     } else if (sub && sub.group === 'staff') {
       var payMode = subPayModeOf(event);
-      var sAmt = payMode === 'adhoc'
-        ? round2(rateOn('adhoc', null, event.date, data.rates) * portion)
-        : round2(rateOn('normal', sub.id, event.date, data.rates, { replaces: event.person_id }) * portion);
-      var subAdhocTemp = payMode === 'adhoc' && isAdhocTempOn(sub.id, event.date, data);
-      var tag = subAdhocTemp ? '(AdHoc · จ่ายรายวัน)' : (payMode === 'adhoc' ? '(AdHoc)' : '(เรทปกติ)');
+      var sAmt, tag;
+      if (isAdhocSubForcedOn(event.date)) {
+        var subInfo = staffAdhocRateInfo(sub.id, event.date, data.rates, { replaces: event.person_id });
+        sAmt = round2(subInfo.rate * portion);
+        var subAdhocTemp = isAdhocTempOn(sub.id, event.date, data);
+        if (subAdhocTemp) {
+          tag = subInfo.usedHigherNormal ? '(เรทปกติ · จ่ายรายวัน)' : '(AdHoc · จ่ายรายวัน)';
+        } else {
+          tag = subInfo.usedHigherNormal ? '(เรทปกติ)' : '(AdHoc)';
+        }
+      } else {
+        sAmt = payMode === 'adhoc'
+          ? round2(rateOn('adhoc', null, event.date, data.rates) * portion)
+          : round2(rateOn('normal', sub.id, event.date, data.rates, { replaces: event.person_id }) * portion);
+        var subAdhocTempLegacy = payMode === 'adhoc' && isAdhocTempOn(sub.id, event.date, data);
+        tag = subAdhocTempLegacy ? '(AdHoc · จ่ายรายวัน)' : (payMode === 'adhoc' ? '(AdHoc)' : '(เรทปกติ)');
+      }
+      var isSubTempBucket = payMode === 'adhoc' && isAdhocTempOn(sub.id, event.date, data);
       out.push({
         person_id: event.person2_id,
         amount: sAmt,
-        bucket: subAdhocTemp ? 'temp' : 'slip',
+        bucket: isSubTempBucket ? 'temp' : 'slip',
         label: d + ' เข้าแทน ' + absentee.nick + half + ' ' + tag + ' +' + fmt2(sAmt)
       });
     } else if (sub && sub.group === 'temp') {
@@ -1688,6 +1731,9 @@ if (typeof module !== 'undefined') {
     fifthWeekAddons: fifthWeekAddons,
     adhocTempEffectiveFrom: adhocTempEffectiveFrom,
     isAdhocTempOn: isAdhocTempOn,
-    isTempPayEvent: isTempPayEvent
+    isTempPayEvent: isTempPayEvent,
+    ADHOC_SUB_EFFECTIVE_FROM: ADHOC_SUB_EFFECTIVE_FROM,
+    isAdhocSubForcedOn: isAdhocSubForcedOn,
+    staffAdhocRateInfo: staffAdhocRateInfo
   };
 }

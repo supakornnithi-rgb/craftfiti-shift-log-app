@@ -1155,7 +1155,8 @@
       if (recState.subMode === 'team') {
         ev.person2_id = recState.teamSub;
         var subP = personById(recState.teamSub);
-        ev.sub_pay = (subP && subP.group === 'director') ? 'adhoc' : recState.payMode;
+        var forceAdhocSub = !!(window.isAdhocSubForcedOn && window.isAdhocSubForcedOn(recState.date));
+        ev.sub_pay = ((subP && subP.group === 'director') || forceAdhocSub) ? 'adhoc' : recState.payMode;
       } else if (recState.subMode === 'outside') {
         ev.person2_id = recState.tempSub;
         ev.sub_pay = 'temp';
@@ -1288,8 +1289,11 @@
           return '<button type="button" class="opt' + (p.id === recState.teamSub ? ' opt-on' : '') + '" data-act="setTeamSub" data-id="' + p.id + '">' + esc(p.nick) + '</button>';
         }).join('') + '</div>';
         var subP2 = recState.teamSub ? personById(recState.teamSub) : null;
+        var forceAdhocSubUi = !!(window.isAdhocSubForcedOn && window.isAdhocSubForcedOn(recState.date));
         if (subP2 && subP2.group === 'director') {
           absentHtml += '<div class="lbl">คนแทนได้ค่าแรงแบบไหน</div><div class="warn-box">' + esc(subP2.nick) + ' เป็นกรรมการ นับเป็น AdHoc อัตโนมัติ</div>';
+        } else if (subP2 && forceAdhocSubUi) {
+          absentHtml += '<div class="lbl">คนแทนได้ค่าแรงแบบไหน</div><div class="warn-box">' + esc(subP2.nick) + ' เป็นพนักงาน คิดเรท AdHoc อัตโนมัติ (หรือเรทปกติหากสูงกว่า)</div>';
         } else if (subP2) {
           absentHtml += '<div class="lbl">คนแทนได้ค่าแรงแบบไหน</div><div class="seg seg-2">' +
             '<button type="button" class="sg' + (recState.payMode === 'normal' ? ' sg-on' : '') + '" data-act="setPayMode" data-m="normal">เรทปกติ</button>' +
